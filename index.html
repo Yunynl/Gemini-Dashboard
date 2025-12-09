@@ -364,12 +364,13 @@
     let chartInstance = null;
     let updateInterval = null;
 
-    window.onload = () => {
-        renderSidebar();
-        GLOBAL_URL = localStorage.getItem('bss_global_url') || "";
-        if(GLOBAL_URL) startDataLoop();
-        else openSettings();
-    };
+window.onload = () => {
+    renderSidebar(); 
+    // 
+    // GLOBAL_URL = localStorage.getItem('bss_global_url') || ""; 
+    if(GLOBAL_URL) startDataLoop();
+    else openSettings();
+};
 
     // --- DIRECT CONTROL ---
     async function sendControl(status) {
