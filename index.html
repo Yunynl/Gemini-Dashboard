@@ -58,22 +58,10 @@
                 <div class="card"><span class="metric-label">Real-time Load</span><span class="metric-value text-primary" id="st-watts">0 W</span></div>
                 <div class="card"><span class="metric-label">Pack Status</span><div class="metric-sub" id="st-dist">--</div></div>
                 <div class="card">
-                    <span class="metric-label">SoH Self-Test</span>
-                    <button class="btn btn-secondary" style="margin-top:10px;" onclick="UI.runSoHSelfTest()">Run 80% Test Cycle</button>
-                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px;">
-                        <input id="test-measured-wh" type="number" value="800" placeholder="Measured Wh">
-                        <input id="test-reference-wh" type="number" value="1000" placeholder="Reference Wh">
-                        <input id="test-soc-low" type="number" value="10" placeholder="SoC Low %">
-                        <input id="test-soc-high" type="number" value="50" placeholder="SoC High %">
-                    </div>
-                    <button class="btn btn-primary" style="margin-top:10px;" onclick="UI.runCustomSoHTest()">Run Custom Test</button>
-                                        <div class="metric-sub" id="soh-test-result" style="margin-top:8px;">Injects 800/1000 Wh window test</div>
-                    <hr style="border-color:var(--border); margin:10px 0;">
-                    <span class="metric-label">Reference CSV Import</span>
-                    <select id="ref-pack-select" style="margin-top:8px;"></select>
-                    <input id="ref-csv-file" type="file" accept=".csv,text/csv" style="margin-top:8px;">
-                    <button class="btn btn-secondary" style="margin-top:10px;" onclick="UI.runReferenceCsvImport()">Import Reference CSV</button>
-                    <div class="metric-sub" id="ref-csv-status" style="margin-top:8px; white-space:pre-line;">No reference file imported.</div>
+                    <span class="metric-label">Hardcoded Reference</span>
+                    <div class="metric-sub">Source: SWAP Battery 11_26 Charging using 200W Charger</div>
+                    <div class="metric-sub" id="ref-csv-status" style="margin-top:8px; white-space:pre-line;">Loading hardcoded reference...</div>
+                    <button class="btn btn-secondary" style="margin-top:10px;" onclick="UI.openReferenceDetail(1)">Open Reference Detail</button>
                 </div>
             </div>
         </div>
@@ -178,7 +166,7 @@
 
             <div class="card full-width">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-                    <span class="metric-label">RAW TELEMETRY LOGS</span>
+                    <span class="metric-label">EVENT ANALYSIS VS REFERENCE</span>
                     <select id="logFilter" onchange="UI.applyLogFilter()">
                         <option value="ALL">All Events</option>
                         <option value="CHARGING">Charging</option>
@@ -188,15 +176,27 @@
                 </div>
 
                 <div style="display:flex; gap:20px; background:#21262d; padding:10px; border-radius:6px; margin-bottom:15px; font-family:'JetBrains Mono'; font-size:0.8rem;">
-                    <div>V_AVG: <span class="text-primary" id="stat-v-avg">--</span></div>
-                    <div>I_AVG: <span class="text-success" id="stat-i-avg">--</span></div>
-                    <div>COUNT: <span style="color:#fff" id="stat-count">0</span></div>
+                    <div>REAL DELTA: <span class="text-primary" id="stat-v-avg">--</span></div>
+                    <div>REF DELTA: <span class="text-success" id="stat-i-avg">--</span></div>
+                    <div>SOH: <span style="color:#fff" id="stat-count">--</span></div>
                 </div>
 
                 <table class="data-table">
                     <thead>
                     <tr>
-                        <th>TIME</th><th>VOLTAGE</th><th>CURRENT</th><th>BAT %</th><th style="text-align:center;">STATUS</th>
+                        <th>TIME</th>
+                        <th>REAL V</th>
+                        <th>REAL A</th>
+                        <th>REAL SOC%</th>
+                        <th>REAL W</th>
+                        <th style="text-align:center;">STATUS</th>
+                        <th>REAL DELTA (Wh)</th>
+                        <th>REF SOC%</th>
+                        <th>REF V</th>
+                        <th>REF A</th>
+                        <th>REF W</th>
+                        <th>REF DELTA (Wh)</th>
+                        <th>SOH</th>
                     </tr>
                     </thead>
                     <tbody id="log-table-body"></tbody>
@@ -221,14 +221,15 @@
 
             <div class="dashboard-grid" style="grid-template-columns: 2fr 1fr;">
                 <div class="card" style="height: 420px;">
-                    <span class="metric-label">Reference Curve (SoC vs Wh)</span>
+                    <span class="metric-label">Reference Charging Profile</span>
+                    <div id="ref-legend" style="display:flex; gap:14px; flex-wrap:wrap; margin:10px 0 14px; font-family:'JetBrains Mono'; font-size:0.8rem;"></div>
                     <canvas id="refChart"></canvas>
                 </div>
                 <div class="card" style="max-height:420px; overflow:auto;">
                     <span class="metric-label">Reference Points</span>
                     <table class="data-table">
                         <thead>
-                        <tr><th>SoC (%)</th><th>Wh</th></tr>
+                        <tr><th>Time</th><th>SoC (%)</th><th>V</th><th>A</th><th>W</th></tr>
                         </thead>
                         <tbody id="ref-table-body"></tbody>
                     </table>
@@ -277,10 +278,6 @@
 <script src="bss_logic.js"></script>
 </body>
 </html>
-
-
-
-
 
 
 
