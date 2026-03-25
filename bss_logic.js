@@ -11,7 +11,7 @@ const DEFAULT_CONFIG = {
     // [Requirement 3] Pack Definitions
     // User inputs Series & Total Mfg Capacity. System calculates Parallel.
     packs: [
-        { id: 'p1', name: 'SWAP Bike Pack', cellId: 'c1', series: 14, mfgAh: 71.4, referenceFullWh: null, referenceSocWhCurve: [], referenceTelemetry: [], referenceLabel: 'Hardcoded SWAP Battery 11_26 Charge' }
+        { id: 'p1', name: 'SWAP Bike Pack', cellId: 'c1', series: 17, mfgAh: 85.0, referenceFullWh: null, referenceSocWhCurve: [], referenceTelemetry: [], referenceLabel: 'Hardcoded SWAP Battery 11_26 Charge' }
     ],
 
     // [Requirement 1] Slot Mapping
@@ -35,8 +35,10 @@ let AppState = {
     updateInterval: null,
     chartInstance: null,
     referenceChartInstance: null,
+    cycleChartInstance: null,
     selectedCycleBySlot: {},
-    analysisStats: null
+    analysisStats: null,
+    minTableFilter: 'ALL'
 };
 let alertSent = false;
 const ROWS_PER_PAGE = 50;
@@ -246,7 +248,22 @@ const Physics = {
         if (!points.length || !Number.isFinite(targetSoc)) return null;
         const sorted = [...points].sort((a, b) => a.soc - b.soc);
         if (targetSoc <= sorted[0].soc) return { ...sorted[0] };
-        if (targetSoc >= sorted[sorted.length - 1].soc) return { ...sorted[sorted.length - 1] };
+        if (targetSoc >= sorted[sorted.length - 1].soc) {
+            const last = sorted[sorted.length - 1];
+            const fullWh = (typeof packCfg.referenceFullWh === 'number' && packCfg.referenceFullWh > last.cumWh)
+                ? packCfg.referenceFullWh : last.cumWh;
+            const fullAh = (typeof packCfg.referenceFullAh === 'number' && packCfg.referenceFullAh > last.cumAh)
+                ? packCfg.referenceFullAh : last.cumAh;
+            const remainSoc = 100 - last.soc;
+            if (remainSoc <= 0) return { ...last };
+            const ratio = Math.min(1, (targetSoc - last.soc) / remainSoc);
+            return {
+                ...last,
+                soc: targetSoc,
+                cumWh: last.cumWh + ratio * (fullWh - last.cumWh),
+                cumAh: last.cumAh + ratio * (fullAh - last.cumAh)
+            };
+        }
         for (let i = 1; i < sorted.length; i++) {
             const a = sorted[i - 1];
             const b = sorted[i];
@@ -278,6 +295,116 @@ const Physics = {
             start,
             end
         };
+    },
+
+    estimateSocFromReferenceVoltage: (packCfg, vol, packSpecs) => {
+        const points = Physics.getReferenceTelemetry(packCfg)
+            .map(p => ({ soc: Number(p.soc), voltageV: Number(p.voltageV) }))
+            .filter(p => Number.isFinite(p.soc) && Number.isFinite(p.voltageV))
+            .sort((a, b) => a.voltageV - b.voltageV);
+        if (points.length < 2 || !Number.isFinite(vol)) {
+            return Physics.calculateSoC(vol, packSpecs.minV, packSpecs.maxV);
+        }
+
+        if (vol <= points[0].voltageV) {
+            const a = points[0];
+            const b = points[1];
+            if (b.voltageV === a.voltageV) return Math.max(0, Math.min(100, a.soc));
+            const ratio = (vol - a.voltageV) / (b.voltageV - a.voltageV);
+            return Math.max(0, Math.min(100, a.soc + ((b.soc - a.soc) * ratio)));
+        }
+        if (vol >= points[points.length - 1].voltageV) {
+            const a = points[points.length - 2];
+            const b = points[points.length - 1];
+            if (b.voltageV === a.voltageV) return Math.max(0, Math.min(100, b.soc));
+            const ratio = (vol - a.voltageV) / (b.voltageV - a.voltageV);
+            return Math.max(0, Math.min(100, a.soc + ((b.soc - a.soc) * ratio)));
+        }
+
+        for (let i = 1; i < points.length; i++) {
+            const a = points[i - 1];
+            const b = points[i];
+            if (vol >= a.voltageV && vol <= b.voltageV) {
+                if (b.voltageV === a.voltageV) return Math.max(0, Math.min(100, a.soc));
+                const ratio = (vol - a.voltageV) / (b.voltageV - a.voltageV);
+                return Math.max(0, Math.min(100, a.soc + ((b.soc - a.soc) * ratio)));
+            }
+        }
+        return Physics.calculateSoC(vol, packSpecs.minV, packSpecs.maxV);
+    },
+
+    interpolateReferencePointByTime: (packCfg, targetTimeS) => {
+        const points = Physics.getReferenceTelemetry(packCfg)
+            .map(p => ({
+                timeS: Number(p.timeS),
+                soc: Number(p.soc),
+                voltageV: Number(p.voltageV),
+                currentA: Number(p.currentA),
+                powerW: Number(p.powerW),
+                cumAh: Number(p.cumAh),
+                cumWh: Number(p.cumWh)
+            }))
+            .filter(p => Number.isFinite(p.timeS))
+            .sort((a, b) => a.timeS - b.timeS);
+        if (!points.length || !Number.isFinite(targetTimeS)) return null;
+        if (targetTimeS <= points[0].timeS) return { ...points[0] };
+        if (targetTimeS >= points[points.length - 1].timeS) {
+            const a = points[points.length - 2];
+            const b = points[points.length - 1];
+            if (b.timeS === a.timeS) return { ...b };
+            const ratio = (targetTimeS - a.timeS) / (b.timeS - a.timeS);
+            const lerp = (x, y) => x + (y - x) * ratio;
+            const fullWh = (typeof packCfg.referenceFullWh === 'number' && packCfg.referenceFullWh > b.cumWh) ? packCfg.referenceFullWh : null;
+            return {
+                timeS: targetTimeS,
+                soc: Math.max(0, Math.min(100, lerp(a.soc, b.soc))),
+                voltageV: lerp(a.voltageV, b.voltageV),
+                currentA: Math.max(0, lerp(a.currentA, b.currentA)),
+                powerW: Math.max(0, lerp(a.powerW, b.powerW)),
+                cumAh: Math.max(b.cumAh, lerp(a.cumAh, b.cumAh)),
+                cumWh: fullWh != null ? Math.min(fullWh, Math.max(b.cumWh, lerp(a.cumWh, b.cumWh))) : Math.max(b.cumWh, lerp(a.cumWh, b.cumWh))
+            };
+        }
+        for (let i = 1; i < points.length; i++) {
+            const a = points[i - 1];
+            const b = points[i];
+            if (targetTimeS >= a.timeS && targetTimeS <= b.timeS) {
+                if (b.timeS === a.timeS) return { ...a };
+                const ratio = (targetTimeS - a.timeS) / (b.timeS - a.timeS);
+                const lerp = (x, y) => x + (y - x) * ratio;
+                return {
+                    timeS: targetTimeS,
+                    soc: lerp(a.soc, b.soc),
+                    voltageV: lerp(a.voltageV, b.voltageV),
+                    currentA: lerp(a.currentA, b.currentA),
+                    powerW: lerp(a.powerW, b.powerW),
+                    cumAh: lerp(a.cumAh, b.cumAh),
+                    cumWh: lerp(a.cumWh, b.cumWh)
+                };
+            }
+        }
+        return { ...points[points.length - 1] };
+    },
+
+    referenceDeltaForEventProgress: (packCfg, startSoc, currentSoc, elapsedMs, status) => {
+        const socDelta = Physics.referenceDeltaForSocWindow(packCfg, startSoc, currentSoc);
+        if (socDelta.deltaWh > 0.05) {
+            return { ...socDelta, method: 'soc-window' };
+        }
+        if (String(status).includes('CHARG') && elapsedMs > 0) {
+            const refStart = Physics.interpolateReferencePoint(packCfg, startSoc);
+            if (!refStart || !Number.isFinite(refStart.timeS)) return { ...socDelta, method: 'soc-window' };
+            const refNow = Physics.interpolateReferencePointByTime(packCfg, refStart.timeS + (elapsedMs / 1000));
+            if (!refNow) return { ...socDelta, method: 'soc-window' };
+            return {
+                deltaWh: Math.abs(refNow.cumWh - refStart.cumWh),
+                deltaAh: Math.abs(refNow.cumAh - refStart.cumAh),
+                start: refStart,
+                end: refNow,
+                method: 'time-fallback'
+            };
+        }
+        return { ...socDelta, method: 'soc-window' };
     },
 
     calculateSoHByWindow: (history, packCfg, packSpecs, windowCfg) => {
@@ -346,6 +473,33 @@ const Physics = {
         if (vol < 10) return 0;
         let soc = ((vol - vMin) / (vMax - vMin)) * 100;
         return Math.max(0, Math.min(100, soc));
+    },
+
+    // Bucket raw 5-second telemetry into 1-minute intervals for cleaner SOC comparison.
+    // Returns array sorted oldest→newest.
+    aggregateToMinutes: (history) => {
+        if (!history || history.length === 0) return [];
+        const buckets = new Map();
+        history.forEach(entry => {
+            const d = new Date(entry.timestamp);
+            const key = `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} `
+                      + `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+            if (!buckets.has(key)) buckets.set(key, []);
+            buckets.get(key).push(entry);
+        });
+        const result = [];
+        for (const [key, entries] of buckets) {
+            const avgVol = entries.reduce((s, e) => s + e.vol, 0) / entries.length;
+            const avgAmp = entries.reduce((s, e) => s + e.amp, 0) / entries.length;
+            const totalWh = Physics.calculateTrapezoidalEnergy(entries);
+            const startSoc = entries[0].soc;
+            const endSoc = entries[entries.length - 1].soc;
+            const statusCounts = {};
+            entries.forEach(e => { statusCounts[e.status] = (statusCounts[e.status] || 0) + 1; });
+            const status = Object.entries(statusCounts).sort((a, b) => b[1] - a[1])[0][0];
+            result.push({ minute: key, avgVol, avgAmp, totalWh, startSoc, endSoc, status, count: entries.length });
+        }
+        return result;
     }
 };
 
@@ -362,7 +516,13 @@ const Analytics = {
         const totalWh = Physics.calculateTrapezoidalEnergy(event.buffer);
         const totalAh = Physics.calculateTrapezoidalChargeAh(event.buffer);
         const windowSoH = Physics.calculateSoHByWindow(event.buffer, packCfg, packSpecs, SYSTEM_CONFIG.sohWindow);
-        const referenceDelta = Physics.referenceDeltaForSocWindow(packCfg, startEntry.soc, endEntry.soc);
+        const referenceDelta = Physics.referenceDeltaForEventProgress(
+            packCfg,
+            startEntry.soc,
+            endEntry.soc,
+            endEntry.timestamp - startEntry.timestamp,
+            event.status
+        );
         const soh = windowSoH.soh !== "--"
             ? windowSoH.soh
             : (referenceDelta.deltaWh > 0 ? Math.min(100, Math.max(0, (totalWh / referenceDelta.deltaWh) * 100)).toFixed(1) : "--");
@@ -380,7 +540,7 @@ const Analytics = {
             totalWh: totalWh.toFixed(2),
             totalAh: totalAh.toFixed(4),
             soh,
-            sohMethod: windowSoH.soh !== "--" ? windowSoH.method : "reference-window-delta",
+            sohMethod: windowSoH.soh !== "--" ? windowSoH.method : `reference-${referenceDelta.method || 'window'}-delta`,
             windowWh: windowSoH.measuredWh != null ? windowSoH.measuredWh.toFixed(2) : totalWh.toFixed(2),
             referenceWh: referenceDelta.deltaWh ? referenceDelta.deltaWh.toFixed(2) : "--",
             referenceAh: referenceDelta.deltaAh ? referenceDelta.deltaAh.toFixed(4) : "--",
@@ -392,77 +552,122 @@ const Analytics = {
     analyzeSlotHistory: (slotId, history, packCfg, packSpecs) => {
         const cycles = [];
         const analysisRows = [];
-        let currentEvent = null;
 
-        const startEvent = (status, entry) => ({ status, buffer: [entry] });
-        const closeEvent = (isActive = false) => {
-            const summary = Analytics.summarizeEvent(slotId, currentEvent, packCfg, packSpecs, isActive);
-            if (summary && !isActive) cycles.push(summary);
-            return summary;
-        };
-
+        // Step 1: Build raw status segments
+        const rawSegments = [];
+        let current = null;
         history.forEach(entry => {
             const normalized = Physics.normalizeStatus(entry.status);
             entry.statusNormalized = normalized;
-
-            if (!currentEvent || currentEvent.status !== normalized) {
-                if (currentEvent && currentEvent.status !== 'IDLE') closeEvent(false);
-                currentEvent = startEvent(normalized, entry);
+            if (!current || current.status !== normalized) {
+                if (current) rawSegments.push(current);
+                current = { status: normalized, buffer: [entry] };
             } else {
-                currentEvent.buffer.push(entry);
+                current.buffer.push(entry);
             }
+        });
+        if (current) rawSegments.push(current);
 
-            if (normalized === 'IDLE') {
-                analysisRows.push({
-                    time: entry.time,
-                    status: normalized,
-                    realVoltage: entry.vol,
-                    realCurrent: entry.amp,
-                    realSoc: entry.soc,
-                    realPower: entry.power,
-                    realDeltaWh: 0,
-                    realDeltaAh: 0,
-                    refSoc: '--',
-                    refVoltage: '--',
-                    refCurrent: '--',
-                    refPower: '--',
-                    refDeltaWh: '--',
-                    refDeltaAh: '--',
-                    soh: '--'
+        // Step 2: Merge same-type events separated by short IDLE gaps (< 5 minutes).
+        // This prevents a single charging session with brief pauses from becoming dozens of tiny events.
+        const GAP_MS = 5 * 60 * 1000;
+        const merged = [];
+        let si = 0;
+        while (si < rawSegments.length) {
+            const seg = rawSegments[si];
+            const last = merged[merged.length - 1];
+            if (
+                seg.status === 'IDLE' &&
+                last && last.status !== 'IDLE' &&
+                si + 1 < rawSegments.length &&
+                rawSegments[si + 1].status === last.status
+            ) {
+                const idleStart = seg.buffer[0].timestamp;
+                const idleEnd = seg.buffer[seg.buffer.length - 1].timestamp;
+                if (idleEnd - idleStart < GAP_MS) {
+                    // Absorb this short idle gap + the following same-type segment into last
+                    last.buffer.push(...seg.buffer);
+                    last.buffer.push(...rawSegments[si + 1].buffer);
+                    si += 2;
+                    continue;
+                }
+            }
+            merged.push({ status: seg.status, buffer: seg.buffer.slice() });
+            si++;
+        }
+
+        // Step 3: Build analysisRows and cycles from merged segments
+        let activeEvent = null;
+        merged.forEach((seg, segIdx) => {
+            const isLast = segIdx === merged.length - 1;
+            const isActive = isLast && seg.status !== 'IDLE';
+
+            if (seg.status === 'IDLE') {
+                seg.buffer.forEach(entry => {
+                    analysisRows.push({
+                        time: entry.time,
+                        status: 'IDLE',
+                        realVoltage: entry.vol,
+                        realCurrent: entry.amp,
+                        realSoc: entry.soc,
+                        realPower: entry.power,
+                        realDeltaWh: 0,
+                        realDeltaAh: 0,
+                        refSoc: '--', refVoltage: '--', refCurrent: '--', refPower: '--',
+                        refDeltaWh: '--', refDeltaAh: '--', soh: '--'
+                    });
                 });
                 return;
             }
 
-            const eventBuffer = currentEvent.buffer;
-            const startEntry = eventBuffer[0];
-            const realDeltaWh = Physics.calculateTrapezoidalEnergy(eventBuffer);
-            const realDeltaAh = Physics.calculateTrapezoidalChargeAh(eventBuffer);
-            const refNow = Physics.interpolateReferencePoint(packCfg, entry.soc);
-            const refStart = Physics.interpolateReferencePoint(packCfg, startEntry.soc);
-            const refDeltaWh = refNow && refStart ? Math.abs(refNow.cumWh - refStart.cumWh) : null;
-            const refDeltaAh = refNow && refStart ? Math.abs(refNow.cumAh - refStart.cumAh) : null;
-            const soh = refDeltaWh && refDeltaWh > 0 ? Math.min(100, Math.max(0, (realDeltaWh / refDeltaWh) * 100)).toFixed(1) : '--';
-
-            analysisRows.push({
-                time: entry.time,
-                status: normalized,
-                realVoltage: entry.vol,
-                realCurrent: entry.amp,
-                realSoc: entry.soc,
-                realPower: entry.power,
-                realDeltaWh,
-                realDeltaAh,
-                refSoc: refNow ? refNow.soc : '--',
-                refVoltage: refNow ? refNow.voltageV : '--',
-                refCurrent: refNow ? refNow.currentA : '--',
-                refPower: refNow ? refNow.powerW : '--',
-                refDeltaWh,
-                refDeltaAh,
-                soh
+            // Build per-entry analysis rows using incremental (O(n)) energy accumulation
+            const startEntry = seg.buffer[0];
+            let cumWh = 0, cumAh = 0;
+            seg.buffer.forEach((entry, entryIdx) => {
+                if (entryIdx > 0) {
+                    const prev = seg.buffer[entryIdx - 1];
+                    const dt = (entry.timestamp - prev.timestamp) / 3600000;
+                    if (dt > 0 && dt < 1) {
+                        cumWh += ((prev.vol * Math.abs(prev.amp) + entry.vol * Math.abs(entry.amp)) / 2) * dt;
+                        cumAh += ((Math.abs(prev.amp) + Math.abs(entry.amp)) / 2) * dt;
+                    }
+                }
+                const refProgress = Physics.referenceDeltaForEventProgress(
+                    packCfg,
+                    startEntry.soc,
+                    entry.soc,
+                    entry.timestamp - startEntry.timestamp,
+                    seg.status
+                );
+                const refNow = refProgress.end;
+                const refDeltaWh = refProgress.deltaWh;
+                const refDeltaAh = refProgress.deltaAh;
+                const soh = refDeltaWh && refDeltaWh > 0 ? Math.min(100, Math.max(0, (cumWh / refDeltaWh) * 100)).toFixed(1) : '--';
+                analysisRows.push({
+                    time: entry.time,
+                    status: seg.status,
+                    realVoltage: entry.vol,
+                    realCurrent: entry.amp,
+                    realSoc: entry.soc,
+                    realPower: entry.power,
+                    realDeltaWh: cumWh,
+                    realDeltaAh: cumAh,
+                    refSoc: refNow ? refNow.soc : '--',
+                    refVoltage: refNow ? refNow.voltageV : '--',
+                    refCurrent: refNow ? refNow.currentA : '--',
+                    refPower: refNow ? refNow.powerW : '--',
+                    refDeltaWh,
+                    refDeltaAh,
+                    soh
+                });
             });
-        });
 
-        const activeEvent = currentEvent && currentEvent.status !== 'IDLE' ? closeEvent(true) : null;
+            const summary = Analytics.summarizeEvent(slotId, { status: seg.status, buffer: seg.buffer }, packCfg, packSpecs, isActive);
+            if (summary) {
+                if (isActive) activeEvent = summary;
+                else cycles.push(summary);
+            }
+        });
 
         return {
             cycles: cycles.reverse(),
@@ -475,7 +680,7 @@ const Analytics = {
 const Charts = {
     update: (history) => {
         const ctx = document.getElementById('batChart').getContext('2d');
-        const recent = history.slice(-50);
+        const recent = history.slice(-300);
 
         if (AppState.chartInstance) {
             AppState.chartInstance.destroy();
@@ -492,7 +697,8 @@ const Charts = {
                         borderColor: '#39c5cf',
                         backgroundColor: '#39c5cf',
                         yAxisID: 'y',
-                        tension: 0.3
+                        tension: 0.3,
+                        pointRadius: 0
                     },
                     {
                         label: 'SoC',
@@ -510,7 +716,8 @@ const Charts = {
                         backgroundColor: '#2ea043',
                         yAxisID: 'y_curr',
                         borderDash: [5,5],
-                        tension: 0.3
+                        tension: 0.3,
+                        pointRadius: 0
                     },
                     {
                         label: 'Power',
@@ -520,7 +727,7 @@ const Charts = {
                         yAxisID: 'y_pow',
                         borderDash: [2,2],
                         tension: 0.3,
-                        pointRadius: 1
+                        pointRadius: 0
                     }
                 ]
             },
@@ -1087,6 +1294,17 @@ const UI = {
             summaryEl.innerText = `Pack: ${packCfg.name} | Charging reference | Time Range: ${points[0].timeS.toFixed(0)}s -> ${points[points.length - 1].timeS.toFixed(0)}s | SoC Range: ${lowSoc.toFixed(2)}% -> ${highSoc.toFixed(2)}% | Window Wh: ${spanWh.toFixed(2)} | Reference Full Wh: ${fullWh.toFixed(2)} | Points: ${points.length}`;
         }
 
+        // Highlight the known power anomaly region (30-40% SoC where power drops from 192W → 178W)
+        const anomalyEl = document.getElementById('ref-anomaly-note');
+        if (anomalyEl) {
+            const p35 = points.find(p => p.soc >= 35 && p.soc <= 36);
+            const p40 = points.find(p => p.soc >= 40 && p.soc <= 41);
+            if (p35 && p40) {
+                anomalyEl.innerHTML = `⚠ <strong>Power Anomaly at 30–40% SoC:</strong> Power drops from ${p35.powerW.toFixed(1)} W (at ${p35.soc.toFixed(1)}%) to ${p40.powerW.toFixed(1)} W (at ${p40.soc.toFixed(1)}%) — cause unconfirmed. Compare other batteries against this reference.`;
+                anomalyEl.style.display = 'block';
+            }
+        }
+
         const ctx = document.getElementById('refChart').getContext('2d');
         if (AppState.referenceChartInstance) AppState.referenceChartInstance.destroy();
         AppState.referenceChartInstance = new Chart(ctx, {
@@ -1156,6 +1374,153 @@ const UI = {
         AppState.selectedCycleBySlot[slotId] = cycleId;
         const slotHistory = AppState.cycleHistory.filter(c => c.slotId === slotId);
         UI.renderCycleDetailPanel(slotId, slotHistory);
+        UI.showCycleModal(slotId, cycleId);
+    },
+
+    showCycleModal: (slotId, cycleId) => {
+        const cycle = AppState.cycleHistory.find(c => c.id === cycleId);
+        if (!cycle) return;
+
+        // Get the raw entries from history within the cycle's time window
+        const slotData = AppState.processedData[slotId];
+        const entries = (slotData?.history || []).filter(e =>
+            e.timestamp >= (cycle.startTimestamp || 0) &&
+            e.timestamp <= (cycle.endTimestamp || Infinity)
+        );
+
+        // Populate stats grid
+        const typeColor = cycle.type === 'CHARGING' ? 'var(--accent-success)' : (cycle.type === 'DISCHARGING' ? 'var(--accent-danger)' : 'var(--accent-primary)');
+        document.getElementById('cycle-modal-title').innerHTML =
+            `<span style="color:${typeColor}">${cycle.type}</span> — Cycle Detail`;
+        document.getElementById('cycle-modal-stats').innerHTML = `
+            <div class="card" style="padding:10px;"><span class="metric-label">Duration</span><div style="font-size:1.1rem; font-weight:600;">${cycle.durationMin} min</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">SoC Range</span><div style="font-size:1.1rem; font-weight:600;">${cycle.startSoc}% → ${cycle.endSoc}%</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">Energy</span><div style="font-size:1.1rem; font-weight:600; color:var(--accent-warning);">${cycle.totalWh} Wh</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">SoH</span><div style="font-size:1.1rem; font-weight:600; color:var(--accent-primary);">${cycle.soh}%</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">Start Time</span><div style="font-size:0.9rem;">${cycle.startTime}</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">End Time</span><div style="font-size:0.9rem;">${cycle.endTime || '--'}</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">Window Wh</span><div style="font-size:0.9rem;">${cycle.windowWh || '--'}</div></div>
+            <div class="card" style="padding:10px;"><span class="metric-label">Ref Wh</span><div style="font-size:0.9rem;">${cycle.referenceWh || '--'}</div></div>
+        `;
+
+        // Build mini chart for the cycle entries
+        const chartEl = document.getElementById('cycle-detail-chart');
+        if (chartEl && entries.length > 1) {
+            if (AppState.cycleChartInstance) { AppState.cycleChartInstance.destroy(); AppState.cycleChartInstance = null; }
+            AppState.cycleChartInstance = new Chart(chartEl.getContext('2d'), {
+                type: 'line',
+                data: {
+                    labels: entries.map(e => e.time.split(' ')[1] || e.time),
+                    datasets: [
+                        { label: 'Voltage', data: entries.map(e => e.vol), borderColor: '#39c5cf', yAxisID: 'y', tension: 0.3, pointRadius: 0 },
+                        { label: 'SoC%', data: entries.map(e => e.soc), borderColor: '#a371f7', yAxisID: 'y_soc', tension: 0.3, pointRadius: 0 },
+                        { label: 'Current', data: entries.map(e => e.amp), borderColor: '#2ea043', yAxisID: 'y_curr', borderDash: [4,3], tension: 0.3, pointRadius: 0 },
+                        { label: 'Power', data: entries.map(e => e.power), borderColor: '#ff9800', yAxisID: 'y_pow', borderDash: [2,2], tension: 0.3, pointRadius: 0 }
+                    ]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0, autoSkip: true }, grid: { color: '#2d333b' } },
+                        y: { type: 'linear', position: 'left', title: { display: true, text: 'V', color: '#39c5cf' }, ticks: { color: '#39c5cf' }, grid: { color: '#2d333b' } },
+                        y_soc: { type: 'linear', position: 'left', min: 0, max: 100, title: { display: true, text: '%', color: '#a371f7' }, ticks: { color: '#a371f7' }, grid: { drawOnChartArea: false } },
+                        y_curr: { type: 'linear', position: 'right', title: { display: true, text: 'A', color: '#2ea043' }, ticks: { color: '#2ea043' }, grid: { drawOnChartArea: false } },
+                        y_pow: { type: 'linear', position: 'right', title: { display: true, text: 'W', color: '#ff9800' }, ticks: { color: '#ff9800' }, grid: { drawOnChartArea: false } }
+                    },
+                    plugins: { legend: { labels: { color: '#c9d1d9', boxWidth: 12 } }, tooltip: { backgroundColor: 'rgba(22,27,34,0.9)', titleColor: '#e6edf3', bodyColor: '#e6edf3', borderColor: '#30363d', borderWidth: 1 } }
+                }
+            });
+        } else if (chartEl) {
+            if (AppState.cycleChartInstance) { AppState.cycleChartInstance.destroy(); AppState.cycleChartInstance = null; }
+            chartEl.getContext('2d').clearRect(0, 0, chartEl.width, chartEl.height);
+        }
+
+        // Populate log table
+        const tbody = document.getElementById('cycle-modal-table-body');
+        tbody.innerHTML = '';
+        entries.forEach(e => {
+            const tr = document.createElement('tr');
+            let badgeClass = e.status.includes('CHARG') ? 'st-charge' : (e.status.includes('DISCH') ? 'st-discharge' : 'st-idle');
+            tr.innerHTML = `
+                <td style="font-family:'JetBrains Mono'; font-size:0.78rem;">${e.time}</td>
+                <td style="color:var(--accent-primary)">${e.vol.toFixed(2)}</td>
+                <td style="color:var(--accent-success)">${e.amp.toFixed(3)}</td>
+                <td style="color:var(--accent-purple)">${e.soc.toFixed(1)}%</td>
+                <td style="color:var(--accent-warning)">${e.power.toFixed(1)}</td>
+                <td><span class="status-badge ${badgeClass}">${e.status}</span></td>
+            `;
+            tbody.appendChild(tr);
+        });
+        document.getElementById('cycle-modal-entry-count').innerText = `${entries.length} data points`;
+        document.getElementById('cycle-detail-modal').style.display = 'flex';
+    },
+
+    closeCycleModal: () => {
+        document.getElementById('cycle-detail-modal').style.display = 'none';
+        if (AppState.cycleChartInstance) { AppState.cycleChartInstance.destroy(); AppState.cycleChartInstance = null; }
+    },
+
+    renderCycleHistoryTable: (slotId, slotHistory) => {
+        const CYCLE_PAGE_SIZE = 20;
+        if (!AppState.cycleHistoryPage) AppState.cycleHistoryPage = {};
+        if (!AppState.cycleHistoryPage[slotId]) AppState.cycleHistoryPage[slotId] = 1;
+
+        const histBody = document.getElementById('history-table-body');
+        const histCount = document.getElementById('history-cycle-count');
+        const histPager = document.getElementById('history-pager');
+        if (!histBody) return;
+
+        histBody.innerHTML = '';
+        if (!slotHistory || slotHistory.length === 0) {
+            histBody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#666;">No completed cycles recorded yet.</td></tr>';
+            if (histCount) histCount.innerText = '';
+            if (histPager) histPager.style.display = 'none';
+            UI.renderCycleDetailPanel(slotId, []);
+            return;
+        }
+
+        if (!AppState.selectedCycleBySlot) AppState.selectedCycleBySlot = {};
+        if (!AppState.selectedCycleBySlot[slotId]) AppState.selectedCycleBySlot[slotId] = slotHistory[0].id;
+
+        const totalPages = Math.ceil(slotHistory.length / CYCLE_PAGE_SIZE) || 1;
+        AppState.cycleHistoryPage[slotId] = Math.max(1, Math.min(AppState.cycleHistoryPage[slotId], totalPages));
+        const page = AppState.cycleHistoryPage[slotId];
+        const start = (page - 1) * CYCLE_PAGE_SIZE;
+        const pageItems = slotHistory.slice(start, start + CYCLE_PAGE_SIZE);
+
+        pageItems.forEach(c => {
+            const tr = document.createElement('tr');
+            tr.style.cursor = 'pointer';
+            if (AppState.selectedCycleBySlot[slotId] === c.id) tr.style.background = 'rgba(88,166,255,0.12)';
+            tr.onclick = () => UI.showCycleDetail(slotId, c.id);
+            tr.innerHTML = `
+                <td class="${c.type==='CHARGING'?'text-success':(c.type==='REFERENCE'?'text-primary':'text-danger')}">${c.type}</td>
+                <td>${c.startTime}</td>
+                <td>${c.durationMin} min</td>
+                <td>${c.startSoc}% → ${c.endSoc}%</td>
+                <td>${c.totalWh}</td>
+                <td title="Method: ${c.sohMethod||'legacy'} | WindowWh: ${c.windowWh||'--'} | RefWh: ${c.referenceWh||'--'}">${c.soh}%</td>
+            `;
+            histBody.appendChild(tr);
+        });
+
+        if (histCount) histCount.innerText = `${slotHistory.length} events — Page ${page}/${totalPages}`;
+        if (histPager) {
+            histPager.style.display = 'flex';
+            const prevBtn = document.getElementById('history-prev');
+            const nextBtn = document.getElementById('history-next');
+            if (prevBtn) prevBtn.disabled = page <= 1;
+            if (nextBtn) nextBtn.disabled = page >= totalPages;
+        }
+        UI.renderCycleDetailPanel(slotId, slotHistory);
+    },
+
+    changeCycleHistoryPage: (slotId, delta) => {
+        if (!AppState.cycleHistoryPage) AppState.cycleHistoryPage = {};
+        AppState.cycleHistoryPage[slotId] = (AppState.cycleHistoryPage[slotId] || 1) + delta;
+        const slotHistory = AppState.cycleHistory.filter(c => c.slotId === slotId);
+        UI.renderCycleHistoryTable(slotId, slotHistory);
     },
 
     renderCycleDetailPanel: (slotId, slotHistory) => {
@@ -1251,35 +1616,13 @@ const UI = {
             : (slotHistory.length > 0 && slotHistory[0].soh !== "--" ? slotHistory[0].soh + "%" : "--%");
         document.getElementById('bat-soh').innerText = currentSoH;
 
-        const histBody = document.getElementById('history-table-body');
-        histBody.innerHTML = '';
-        if (slotHistory.length > 0) {
-            if (!AppState.selectedCycleBySlot) AppState.selectedCycleBySlot = {};
-            if (!AppState.selectedCycleBySlot[id]) AppState.selectedCycleBySlot[id] = slotHistory[0].id;
-
-            slotHistory.slice(0, 5).forEach(c => {
-                const tr = document.createElement('tr');
-                tr.style.cursor = 'pointer';
-                if (AppState.selectedCycleBySlot[id] === c.id) tr.style.background = 'rgba(88,166,255,0.12)';
-                tr.onclick = () => UI.showCycleDetail(id, c.id);
-                tr.innerHTML = `
-                    <td class="${c.type==='CHARGING'?'text-success':(c.type==='REFERENCE'?'text-primary':'text-danger')}">${c.type}</td>
-                    <td>${c.startTime}</td>
-                    <td>${c.durationMin} min</td>
-                    <td>${c.startSoc}% -> ${c.endSoc}%</td>
-                    <td>${c.totalWh}</td>
-                    <td title="Method: ${c.sohMethod || "legacy"} | WindowWh: ${c.windowWh || "--"} | RefWh: ${c.referenceWh || "--"}">${c.soh}%</td>
-                `;
-                histBody.appendChild(tr);
-            });
-            UI.renderCycleDetailPanel(id, slotHistory);
-        } else {
-            histBody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#666;">No completed cycles recorded yet.</td></tr>';
-            UI.renderCycleDetailPanel(id, []);
-        }
+        if (!AppState.cycleHistoryPage) AppState.cycleHistoryPage = {};
+        if (!AppState.cycleHistoryPage[id]) AppState.cycleHistoryPage[id] = 1;
+        UI.renderCycleHistoryTable(id, slotHistory);
         Charts.update(d.history);
         AppState.activeLogData = [...(d.analysisRows || [])];
         UI.applyLogFilter(false);
+        UI.renderMinuteTable(id);
     },
 
     // Table Logic
@@ -1400,6 +1743,49 @@ const UI = {
     addPackConfig: () => { SYSTEM_CONFIG.packs.push({ id: 'p' + Date.now(), name: 'New Pack', cellId: SYSTEM_CONFIG.cells[0]?.id, series: 1, mfgAh: 10, referenceFullWh: null, referenceSocWhCurve: [] }); UI.renderConfigLists(); },
     addSlot: () => { SYSTEM_CONFIG.slots.push({ id: Date.now(), name: 'Slot X', packId: SYSTEM_CONFIG.packs[0]?.id, colVol: 0, colAmp: 0, colStat: 0, colSoc: 0 }); UI.renderConfigLists(); },
 
+    setMinTableFilter: (filter) => {
+        AppState.minTableFilter = filter;
+        // Update button active states
+        ['ALL','CHARGING','DISCHARGING','IDLE'].forEach(f => {
+            const btn = document.getElementById('min-filter-' + f);
+            if (btn) btn.style.opacity = (f === filter) ? '1' : '0.4';
+        });
+        // Re-render using last known slot id stored on the table
+        const slotId = Number(document.getElementById('min-table-body')?.dataset?.slotId);
+        if (slotId) UI.renderMinuteTable(slotId);
+    },
+
+    renderMinuteTable: (id) => {
+        const d = AppState.processedData[id];
+        const tbody = document.getElementById('min-table-body');
+        const countEl = document.getElementById('min-table-count');
+        if (!d || !tbody) return;
+        tbody.dataset.slotId = id;
+        const filter = AppState.minTableFilter || 'ALL';
+        const allRows = Physics.aggregateToMinutes(d.history);
+        const filtered = filter === 'ALL' ? allRows : allRows.filter(r => r.status === filter);
+        tbody.innerHTML = '';
+        // Show latest 300 minutes (most recent first)
+        const display = filtered.slice().reverse().slice(0, 300);
+        display.forEach(r => {
+            const tr = document.createElement('tr');
+            let badgeClass = 'st-idle';
+            if (r.status.includes('CHARG')) badgeClass = 'st-charge';
+            if (r.status.includes('DISCH')) badgeClass = 'st-discharge';
+            tr.innerHTML = `
+                <td style="font-family:'JetBrains Mono'; font-size:0.8rem;">${r.minute}</td>
+                <td style="color:var(--accent-primary)">${r.avgVol.toFixed(2)}</td>
+                <td style="color:var(--accent-success)">${r.avgAmp.toFixed(3)}</td>
+                <td style="color:var(--accent-warning)">${r.totalWh.toFixed(3)}</td>
+                <td style="color:var(--accent-purple)">${r.startSoc.toFixed(1)}% → ${r.endSoc.toFixed(1)}%</td>
+                <td><span class="status-badge ${badgeClass}">${r.status}</span></td>
+                <td style="color:#666; font-size:0.75rem">${r.count}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+        if (countEl) countEl.innerText = `${filtered.length} min (${filter}) — latest ${Math.min(filtered.length, 300)} shown`;
+    },
+
     saveSettings: () => {
         SYSTEM_CONFIG.url = document.getElementById('cfg-url').value.trim();
         localStorage.setItem('bss_sys_config_v5', JSON.stringify(SYSTEM_CONFIG));
@@ -1439,6 +1825,28 @@ const API = {
         try { await fetch(url, {mode:'no-cors'}); btnFeedback.innerText = "OK"; setTimeout(()=>btnFeedback.innerText="",2000); }
         catch(e) { btnFeedback.innerText = "Error"; }
     },
+    loadLocalCSV: () => {
+        // Lets the user load the full PRASIMAX CSV directly from disk, bypassing Google Sheets row limits
+        const inp = document.createElement('input');
+        inp.type = 'file';
+        inp.accept = '.csv';
+        inp.onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const statusEl = document.getElementById('conn-status');
+            statusEl.innerText = 'LOADING...';
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                API.processCSV(ev.target.result);
+                statusEl.innerText = `LOCAL: ${file.name}`;
+                statusEl.style.color = 'var(--accent-warning)';
+            };
+            reader.onerror = () => { statusEl.innerText = 'FILE READ ERROR'; statusEl.style.color = 'var(--accent-danger)'; };
+            reader.readAsText(file);
+        };
+        inp.click();
+    },
+
     sendAlert: async (message) => {
         let url = SYSTEM_CONFIG.url.split('?')[0] + `?mode=alert&msg=${encodeURIComponent(message)}`;
         try { await fetch(url, {mode:'no-cors'}); } catch(e) {}
@@ -1452,6 +1860,7 @@ const API = {
         }
         return fallbackIndex;
     },
+
     processCSV: (text) => {
         const lines = text.trim().split(/\r?\n/);
         const data = lines.map(line => line.split(',').map(c => c.replace(/^"|"$/g, '').trim()));
@@ -1471,33 +1880,47 @@ const API = {
             const history = [];
             let latest = null;
             let nonZeroCurrentCount = 0;
+            let badDataCount = 0;
+            // Valid voltage range: must be within ±20% of pack limits to be considered real data
+            const volMin = specs.minV * 0.80;
+            const volMax = specs.maxV * 1.15;
 
             for(let i=1; i<data.length; i++) {
                 const row = data[i];
-                if(row.length < 6) continue;
+                if(row.length < 3) continue;
 
                 const dateStr = row[0];
                 const timeStr = row[1];
-                const cleanTime = Physics.formatTimeDisplay(dateStr, timeStr);
-                const ts = Physics.getTimestamp(dateStr, timeStr);
 
                 const vol = parseFloat(row[colVol]);
                 const amp = parseFloat(row[colAmp]);
-                let sheetSocRaw = row[colSoc];
-                if(sheetSocRaw && typeof sheetSocRaw === 'string') sheetSocRaw = sheetSocRaw.replace('%','');
-                let sheetSoc = parseFloat(sheetSocRaw);
-                if(!isNaN(sheetSoc) && sheetSoc <= 1.0 && sheetSoc > 0) sheetSoc = sheetSoc * 100;
 
-                const status = (row[colStat] || "IDLE").toUpperCase();
-
-                if(!isNaN(vol) && !isNaN(amp)) {
-                    let soc = isNaN(sheetSoc) ? Physics.calculateSoC(vol, specs.minV, specs.maxV) : sheetSoc;
-                    const power = vol * amp;
-                    const entry = { time: cleanTime, timestamp: ts, vol, amp, power, soc, status: Physics.normalizeStatus(status) };
-                    history.push(entry);
-                    latest = entry;
-                    if (Math.abs(amp) > 0.001) nonZeroCurrentCount++;
+                // Skip bad data: missing, zero, negative, or out-of-range voltage readings
+                if(!isFinite(vol) || !isFinite(amp) || vol <= 0 || vol < volMin || vol > volMax) {
+                    badDataCount++;
+                    continue;
                 }
+
+                const cleanTime = Physics.formatTimeDisplay(dateStr, timeStr);
+                const ts = Physics.getTimestamp(dateStr, timeStr);
+
+                if(!isFinite(ts)) { badDataCount++; continue; }
+
+                // Estimate live SoC from the hardcoded reference voltage curve when available.
+                const soc = Physics.estimateSocFromReferenceVoltage(packCfg, vol, specs);
+                const power = vol * amp;
+                const entry = {
+                    time: cleanTime,
+                    timestamp: ts,
+                    vol,
+                    amp,
+                    power,
+                    soc,
+                    status: Physics.normalizeStatus((row[colStat] || "IDLE").toUpperCase())
+                };
+                history.push(entry);
+                latest = entry;
+                if (Math.abs(amp) > 0.001) nonZeroCurrentCount++;
             }
 
             if(latest) {
@@ -1518,7 +1941,7 @@ const API = {
                     history,
                     analysisRows: analysis.analysisRows,
                     activeEvent: analysis.activeEvent,
-                    diagnostics: { colVol, colAmp, colStat, colSoc, nonZeroCurrentCount }
+                    diagnostics: { colVol, colAmp, colStat, colSoc, nonZeroCurrentCount, badDataCount, totalRows: data.length - 1 }
                 };
             }
         });
@@ -1548,19 +1971,25 @@ window.onload = () => {
             ...p
         }));
     }
+    // Auto-migrate: if stored pack still has old 14S config (SWAP is 17S per reference CSV metadata)
+    SYSTEM_CONFIG.packs.forEach(p => {
+        if (p.series === 14) {
+            p.series = 17;
+            p.mfgAh = 85.0;
+        }
+    });
+
     const firstPack = SYSTEM_CONFIG.packs[0];
     if (firstPack) {
         firstPack.referenceTelemetry = HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({ ...p }));
         firstPack.referenceSocWhCurve = HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({ soc: p.soc, wh: p.cumWh }));
         firstPack.referenceFullWh = HARD_CODED_REFERENCE_PROFILE.estimatedFullWh;
+        firstPack.referenceFullAh = HARD_CODED_REFERENCE_PROFILE.estimatedFullAh;
         firstPack.referenceLabel = HARD_CODED_REFERENCE_PROFILE.label;
     }
     UI.renderSidebar();
     if (SYSTEM_CONFIG.url) API.startDataLoop(); else UI.openSettings();
 };
-
-
-
 
 
 

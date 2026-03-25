@@ -31,6 +31,10 @@
     <div id="unit-list"></div>
 
     <div style="margin-top: auto;">
+        <div class="nav-item" onclick="API.loadLocalCSV()" style="color: var(--accent-warning);">
+            <span>Load CSV File</span>
+            <span class="nav-tag" style="border-color:var(--accent-warning); color:var(--accent-warning);">LOCAL</span>
+        </div>
         <div class="nav-item" onclick="UI.openSettings()"><span>System Configuration</span></div>
         <div id="conn-status" style="padding: 10px; font-size: 0.7rem; text-align: center; font-family:'JetBrains Mono';">DISCONNECTED</div>
     </div>
@@ -143,7 +147,10 @@
 
             <div class="dashboard-grid full-width" style="grid-template-columns: 2fr 1fr; margin-bottom: 20px;">
                 <div class="card">
-                    <span class="metric-title" style="margin-bottom:15px; display:block;">CYCLE HISTORY (Analytics)</span>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                        <span class="metric-title">CYCLE HISTORY (Analytics)</span>
+                        <span class="metric-sub" id="history-cycle-count">--</span>
+                    </div>
                     <table class="data-table">
                         <thead>
                         <tr>
@@ -157,10 +164,44 @@
                         </thead>
                         <tbody id="history-table-body"></tbody>
                     </table>
+                    <div id="history-pager" style="display:none; justify-content:center; gap:10px; margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                        <button class="btn btn-secondary" id="history-prev" onclick="UI.changeCycleHistoryPage(AppState.currentView, -1)">← Prev</button>
+                        <button class="btn btn-secondary" id="history-next" onclick="UI.changeCycleHistoryPage(AppState.currentView, 1)">Next →</button>
+                    </div>
                 </div>
                 <div class="card">
                     <span class="metric-title" style="margin-bottom:10px; display:block;">CYCLE DETAIL</span>
                     <div id="cycle-detail-panel" class="metric-sub">Select a cycle row to view details.</div>
+                </div>
+            </div>
+
+            <div class="card full-width">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    <span class="metric-label">1-MIN AGGREGATED DATA</span>
+                    <span class="metric-sub" id="min-table-count">--</span>
+                </div>
+                <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center;">
+                    <span class="metric-sub" style="margin-right:4px;">Filter:</span>
+                    <button id="min-filter-ALL" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:1;" onclick="UI.setMinTableFilter('ALL')">All</button>
+                    <button id="min-filter-CHARGING" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:0.4; color:var(--accent-success); border-color:var(--accent-success);" onclick="UI.setMinTableFilter('CHARGING')">Charging</button>
+                    <button id="min-filter-DISCHARGING" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:0.4; color:var(--accent-danger); border-color:var(--accent-danger);" onclick="UI.setMinTableFilter('DISCHARGING')">Discharging</button>
+                    <button id="min-filter-IDLE" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:0.4;" onclick="UI.setMinTableFilter('IDLE')">Idle</button>
+                </div>
+                <div style="max-height: 300px; overflow-y: auto;">
+                    <table class="data-table">
+                        <thead>
+                        <tr>
+                            <th>TIME</th>
+                            <th>AVG V</th>
+                            <th>AVG A</th>
+                            <th>ENERGY (Wh)</th>
+                            <th>SOC RANGE</th>
+                            <th>STATUS</th>
+                            <th>SAMPLES</th>
+                        </tr>
+                        </thead>
+                        <tbody id="min-table-body"></tbody>
+                    </table>
                 </div>
             </div>
 
@@ -214,6 +255,7 @@
             <div class="card full-width" style="margin-bottom: 20px;">
                 <span class="metric-title" style="margin-bottom:8px; display:block;">REFERENCE PROFILE DETAIL</span>
                 <div id="ref-summary" class="metric-sub">No reference data loaded.</div>
+                <div id="ref-anomaly-note" style="display:none; margin-top:12px; padding:10px; background:rgba(210,153,34,0.12); border:1px solid var(--accent-warning); border-radius:6px; font-size:0.85rem; color:var(--accent-warning);"></div>
                 <div style="margin-top: 12px;">
                     <button class="btn btn-secondary" onclick="UI.backToBatteryFromReference()">Back To Battery View</button>
                 </div>
@@ -275,10 +317,44 @@
     </div>
 </div>
 
+<div id="cycle-detail-modal" class="modal-overlay" style="display:none; align-items:flex-start; padding:40px 20px; overflow-y:auto;">
+    <div class="modal" style="max-width:960px; width:100%; max-height:90vh; overflow-y:auto;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+            <h2 id="cycle-modal-title" style="margin:0;">Cycle Detail</h2>
+            <button class="btn btn-secondary" onclick="UI.closeCycleModal()">✕ Close</button>
+        </div>
+
+        <div id="cycle-modal-stats" style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; margin-bottom:20px;"></div>
+
+        <div style="height:280px; margin-bottom:20px;">
+            <span class="metric-label">Cycle Charge Profile</span>
+            <canvas id="cycle-detail-chart"></canvas>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <span class="metric-label">RAW DATA LOG</span>
+            <span class="metric-sub" id="cycle-modal-entry-count">--</span>
+        </div>
+        <div style="max-height:300px; overflow-y:auto;">
+            <table class="data-table">
+                <thead>
+                <tr>
+                    <th>TIME</th>
+                    <th>VOLTAGE (V)</th>
+                    <th>CURRENT (A)</th>
+                    <th>SOC %</th>
+                    <th>POWER (W)</th>
+                    <th>STATUS</th>
+                </tr>
+                </thead>
+                <tbody id="cycle-modal-table-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
 <script src="bss_logic.js"></script>
 </body>
 </html>
-
-
 
 
