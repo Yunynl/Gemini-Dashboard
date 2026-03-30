@@ -146,24 +146,42 @@ const Physics = {
 
     // Classify idle sub-types and detect fake charging/discharging.
     // Returns: CHARGING, DISCHARGING, REAL_IDLE, STICKY_RELAY_IDLE, CHARGING_IDLE, DISCHARGING_IDLE
-    classifyState: (status, current, prevSoc, currSoc) => {
+    // Pass 1: single-point classification based on current only.
+    // Pass 2 (applyStickyRelayUpgrade) upgrades CHG/DSCH IDLE runs > threshold to STICKY_RELAY_IDLE.
+    classifyState: (status, current) => {
         const amp = Math.abs(current || 0);
-        const socDelta = (currSoc != null && prevSoc != null) ? currSoc - prevSoc : null;
-
         if (status === 'IDLE') {
             return amp >= 0.1 ? 'STICKY_RELAY_IDLE' : 'REAL_IDLE';
         }
         if (status === 'CHARGING') {
-            // Charging but SoC not increasing (or dropping) → fake charge
-            if (socDelta !== null && socDelta <= 0 && amp < 0.1) return 'CHARGING_IDLE';
-            return 'CHARGING';
+            return amp < 0.1 ? 'CHARGING_IDLE' : 'CHARGING';
         }
         if (status === 'DISCHARGING') {
-            // Discharging but SoC not decreasing (or rising) → fake discharge
-            if (socDelta !== null && socDelta >= 0 && amp < 0.1) return 'DISCHARGING_IDLE';
-            return 'DISCHARGING';
+            return amp < 0.1 ? 'DISCHARGING_IDLE' : 'DISCHARGING';
         }
         return 'REAL_IDLE';
+    },
+
+    // Pass 2: Scan history for consecutive CHARGING_IDLE / DISCHARGING_IDLE runs.
+    // If a run exceeds STICKY_THRESHOLD_MS, upgrade entire run to STICKY_RELAY_IDLE.
+    // Rationale: brief 0A pauses during charge/discharge are normal; sustained 0A means relay is stuck.
+    applyStickyRelayUpgrade: (history, thresholdMs) => {
+        const STICKY_THRESHOLD_MS = thresholdMs || 60000; // default 60 seconds
+        let runStart = null;
+        for (let i = 0; i < history.length; i++) {
+            const ds = history[i].detailedStatus;
+            if (ds === 'CHARGING_IDLE' || ds === 'DISCHARGING_IDLE') {
+                if (runStart === null) runStart = i;
+                const duration = history[i].timestamp - history[runStart].timestamp;
+                if (duration >= STICKY_THRESHOLD_MS) {
+                    for (let j = runStart; j <= i; j++) {
+                        history[j].detailedStatus = 'STICKY_RELAY_IDLE';
+                    }
+                }
+            } else {
+                runStart = null;
+            }
+        }
     },
 
     // Get badge CSS class and display label for a detailed status
@@ -1495,51 +1513,57 @@ const UI = {
         let endIdx = parseInt(endSlider.value);
 
         // Prevent crossover
-        if (startIdx > endIdx) {
-            startIdx = endIdx;
-            startSlider.value = startIdx;
-        }
+        if (startIdx > endIdx) { startIdx = endIdx; startSlider.value = startIdx; }
 
-        const sliced = allEntries.slice(startIdx, endIdx + 1);
-
-        // Update range labels
-        const startTime = sliced.length > 0 ? sliced[0].time : '--';
-        const endTime = sliced.length > 0 ? sliced[sliced.length - 1].time : '--';
+        // Update labels instantly (cheap)
+        const startTime = allEntries[startIdx]?.time || '--';
+        const endTime = allEntries[endIdx]?.time || '--';
+        const count = endIdx - startIdx + 1;
         const rangeLabel = document.getElementById('cycle-time-range-label');
-        if (rangeLabel) rangeLabel.innerText = `${sliced.length} of ${allEntries.length} points`;
-        const startLabel = document.getElementById('cycle-range-start-time');
-        const endLabel = document.getElementById('cycle-range-end-time');
-        if (startLabel) startLabel.innerText = startTime;
-        if (endLabel) endLabel.innerText = endTime;
+        if (rangeLabel) rangeLabel.innerText = `${count} of ${allEntries.length} points`;
+        document.getElementById('cycle-range-start-time').innerText = startTime;
+        document.getElementById('cycle-range-end-time').innerText = endTime;
 
-        UI.renderCycleModalView(sliced);
+        // Debounce the heavy chart+table render (200ms)
+        clearTimeout(AppState._cycleRangeTimer);
+        AppState._cycleRangeTimer = setTimeout(() => {
+            const sliced = allEntries.slice(startIdx, endIdx + 1);
+            UI.renderCycleModalView(sliced);
+        }, 200);
     },
 
     renderCycleModalView: (entries) => {
-        // Update range labels
         const allEntries = AppState.cycleModalEntries || entries;
-        const rangeLabel = document.getElementById('cycle-time-range-label');
-        const startLabel = document.getElementById('cycle-range-start-time');
-        const endLabel = document.getElementById('cycle-range-end-time');
+
+        // Update range labels
         if (entries.length > 0) {
+            const rangeLabel = document.getElementById('cycle-time-range-label');
             if (rangeLabel) rangeLabel.innerText = `${entries.length} of ${allEntries.length} points`;
+            const startLabel = document.getElementById('cycle-range-start-time');
+            const endLabel = document.getElementById('cycle-range-end-time');
             if (startLabel) startLabel.innerText = entries[0].time;
             if (endLabel) endLabel.innerText = entries[entries.length - 1].time;
         }
 
-        // Build chart
+        // Downsample for chart (max 500 points)
+        const MAX_CHART = 500;
+        const chartEntries = entries.length > MAX_CHART
+            ? entries.filter((_, i) => i % Math.ceil(entries.length / MAX_CHART) === 0)
+            : entries;
+
+        // Build chart with downsampled data
         const chartEl = document.getElementById('cycle-detail-chart');
-        if (chartEl && entries.length > 1) {
+        if (chartEl && chartEntries.length > 1) {
             if (AppState.cycleChartInstance) { AppState.cycleChartInstance.destroy(); AppState.cycleChartInstance = null; }
             AppState.cycleChartInstance = new Chart(chartEl.getContext('2d'), {
                 type: 'line',
                 data: {
-                    labels: entries.map(e => e.time.split(' ')[1] || e.time),
+                    labels: chartEntries.map(e => e.time.split(' ')[1] || e.time),
                     datasets: [
-                        { label: 'Voltage', data: entries.map(e => e.vol), borderColor: '#39c5cf', yAxisID: 'y', tension: 0.3, pointRadius: 0 },
-                        { label: 'SoC%', data: entries.map(e => e.soc), borderColor: '#a371f7', yAxisID: 'y_soc', tension: 0.3, pointRadius: 0 },
-                        { label: 'Current', data: entries.map(e => e.amp), borderColor: '#2ea043', yAxisID: 'y_curr', borderDash: [4,3], tension: 0.3, pointRadius: 0 },
-                        { label: 'Power', data: entries.map(e => e.power), borderColor: '#ff9800', yAxisID: 'y_pow', borderDash: [2,2], tension: 0.3, pointRadius: 0 }
+                        { label: 'Voltage', data: chartEntries.map(e => e.vol), borderColor: '#39c5cf', yAxisID: 'y', tension: 0.3, pointRadius: 0 },
+                        { label: 'SoC%', data: chartEntries.map(e => e.soc), borderColor: '#a371f7', yAxisID: 'y_soc', tension: 0.3, pointRadius: 0 },
+                        { label: 'Current', data: chartEntries.map(e => e.amp), borderColor: '#2ea043', yAxisID: 'y_curr', borderDash: [4,3], tension: 0.3, pointRadius: 0 },
+                        { label: 'Power', data: chartEntries.map(e => e.power), borderColor: '#ff9800', yAxisID: 'y_pow', borderDash: [2,2], tension: 0.3, pointRadius: 0 }
                     ]
                 },
                 options: {
@@ -1560,10 +1584,12 @@ const UI = {
             chartEl.getContext('2d').clearRect(0, 0, chartEl.width, chartEl.height);
         }
 
-        // Populate log table
+        // Cap table at 200 rows for performance
+        const MAX_TABLE = 200;
         const tbody = document.getElementById('cycle-modal-table-body');
         tbody.innerHTML = '';
-        entries.forEach(e => {
+        const tableEntries = entries.length > MAX_TABLE ? entries.slice(0, MAX_TABLE) : entries;
+        tableEntries.forEach(e => {
             const tr = document.createElement('tr');
             const bi = Physics.statusBadgeInfo(e.detailedStatus || e.status);
             tr.innerHTML = `
@@ -1576,7 +1602,8 @@ const UI = {
             `;
             tbody.appendChild(tr);
         });
-        document.getElementById('cycle-modal-entry-count').innerText = `${entries.length} data points`;
+        const note = entries.length > MAX_TABLE ? ` (showing first ${MAX_TABLE})` : '';
+        document.getElementById('cycle-modal-entry-count').innerText = `${entries.length} data points${note}`;
     },
 
     closeCycleModal: () => {
@@ -2142,8 +2169,7 @@ const API = {
                 const soc = Physics.estimateSocFromReferenceVoltage(packCfg, vol, specs);
                 const power = vol * amp;
                 const baseStatus = Physics.normalizeStatus((row[colStat] || "IDLE").toUpperCase());
-                const prevSoc = history.length > 0 ? history[history.length - 1].soc : null;
-                const detailedStatus = Physics.classifyState(baseStatus, amp, prevSoc, soc);
+                const detailedStatus = Physics.classifyState(baseStatus, amp);
                 const entry = {
                     time: cleanTime,
                     timestamp: ts,
@@ -2158,6 +2184,9 @@ const API = {
                 latest = entry;
                 if (Math.abs(amp) > 0.001) nonZeroCurrentCount++;
             }
+
+            // Pass 2: upgrade sustained CHG/DSCH IDLE runs to STICKY_RELAY_IDLE
+            Physics.applyStickyRelayUpgrade(history, 60000);
 
             if(latest) {
                 const energyAvailable = specs.idealWh * (latest.soc / 100);
