@@ -33,6 +33,26 @@ function doGet(e) {
       .setMimeType(ContentService.MimeType.TEXT);
   }
 
+  //ALERT MODE
+
+  if (e && e.parameter && e.parameter.mode === 'alert') {
+    var msg = e.parameter.msg || 'Unknown alert';
+    var recipient = 'zli37836@gmail.com'; // ← CHANGE THIS to real email
+    var subject = '⚠ BSS ALERT: ' + msg.substring(0, 80);
+    var body = 'BSS Monitoring Alert\n\n'
+        + 'Time: ' + Utilities.formatDate(new Date(), timeZone, 'yyyy-MM-dd HH:mm:ss') + '\n'
+        + 'Message: ' + msg + '\n\n'
+        + 'Please check the BSS dashboard for details.';
+
+    try {
+      MailApp.sendEmail(recipient, subject, body);
+      return ContentService.createTextOutput('ALERT_SENT').setMimeType(ContentService.MimeType.TEXT);
+    } catch (err) {
+      Logger.log('Alert email failed: ' + err);
+      return ContentService.createTextOutput('ALERT_FAILED').setMimeType(ContentService.MimeType.TEXT);
+    }
+  }
+
   // ── CONTROL COMMANDS ───────────────────────────────────────────────────────
   // Read battery commands from prasimax_control sheet (A2=bat1, B2=bat2)
   var cmd1 = 'Idle';

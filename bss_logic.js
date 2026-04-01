@@ -42,6 +42,7 @@ let AppState = {
     minTableWindow: 1
 };
 let alertSent = false;
+let stickyAlertSent = false;
 const ROWS_PER_PAGE = 50;
 
 const HARD_CODED_REFERENCE_PROFILE = {
@@ -365,11 +366,11 @@ const Physics = {
     // 3rd-order polynomial SoC from per-cell voltage.
     // Derived from: SoC% = -0.04004*Vpack³ + 7.76563*Vpack² - 492.91*Vpack + 10281.84 (17S)
     // Converted to per-cell coefficients so it adapts to any series count.
-    // Uncertainty: ±2.20%
+    // R^2 = 0.9988, RMSE = 0.51%, max error = 2.19%
     voltageToSoc: (packVoltage, seriesCount) => {
         if (!Number.isFinite(packVoltage) || !seriesCount || seriesCount <= 0) return 0;
         const v = packVoltage / seriesCount;
-        const soc = -196.7165 * v * v * v + 2244.267 * v * v - 8379.47 * v + 10281.84;
+        const soc = -226.8723 * v * v * v + 2566.6181 * v * v - 9524.9099 * v + 11635.6455;
         return Math.max(0, Math.min(100, Math.round(soc * 100) / 100));
     },
 
@@ -1789,6 +1790,11 @@ const UI = {
                 bar.classList.add('state-danger'); txt.innerText = "STICKY RELAY — DANGER";
                 badge.className = "status-badge st-sticky-relay"; badge.innerText = "STUCK RELAY";
                 if (stickyWarning) stickyWarning.style.display = 'flex';
+                // Send email alert once per data sync
+                if (!stickyAlertSent) {
+                    API.sendAlert(`STICKY RELAY on ${slotConfig.name} — V=${d.vol}V, I=${d.amp}A, status=${d.status}`);
+                    stickyAlertSent = true;
+                }
             } else if (ds === 'CHARGING_IDLE') {
                 bar.classList.add('state-idle'); txt.innerText = "CHARGING IDLE (FAKE)";
                 badge.className = "status-badge st-charging-idle"; badge.innerText = "CHG IDLE";
@@ -2121,6 +2127,7 @@ const API = {
     },
 
     processCSV: (text) => {
+        stickyAlertSent = false; // reset email alert flag on new data sync
         const lines = text.trim().split(/\r?\n/);
         const data = lines.map(line => line.split(',').map(c => c.replace(/^"|"$/g, '').trim()));
         const cycleRecords = [];
