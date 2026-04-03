@@ -1,4 +1,11 @@
 ﻿
+// ── Master Cell Lookup Table (from 21700 datasheet) ─────────────────────
+// Used to generate per-pack polynomial SoC coefficients at runtime.
+const CELL_LOOKUP = {
+    soc:     [100, 93.2, 81.8, 69.4, 55.0, 28.0, 22.2, 11.4, 6.0, 1.2, 0.0],
+    voltage: [4.2, 4.1,  4.0,  3.9,  3.8,  3.7,  3.6,  3.5,  3.4, 3.3, 3.2]
+};
+
 const DEFAULT_CONFIG = {
     // Google Script URL
     url: "https://script.google.com/macros/s/AKfycbxWgnqV5zJ7IoN4zpLS16Kju4OfkvddtzxcwPNmBAmdAjHxhzS-Xywce6kRI1UwH3tebw/exec",
@@ -10,8 +17,9 @@ const DEFAULT_CONFIG = {
 
     // [Requirement 3] Pack Definitions
     // User inputs Series & Total Mfg Capacity. System calculates Parallel.
+    // socCoeffs: auto-generated from CELL_LOOKUP at startup (per-pack polynomial)
     packs: [
-        { id: 'p1', name: 'SWAP Bike Pack', cellId: 'c1', series: 17, mfgAh: 85.0, referenceFullWh: null, referenceSocWhCurve: [], referenceTelemetry: [], referenceLabel: 'Hardcoded SWAP Battery 11_26 Charge' }
+        { id: 'p1', name: 'SWAP Bike Pack', cellId: 'c1', series: 17, mfgAh: 85.0, socCoeffs: null, referenceFullWh: null, referenceSocWhCurve: [], referenceTelemetry: [], referenceLabel: 'Hardcoded SWAP Battery 11_26 Charge' }
     ],
 
     // [Requirement 1] Slot Mapping
@@ -363,20 +371,87 @@ const Physics = {
         };
     },
 
-    // 3rd-order polynomial SoC from per-cell voltage.
-    // Derived from: SoC% = -0.04004*Vpack³ + 7.76563*Vpack² - 492.91*Vpack + 10281.84 (17S)
-    // Converted to per-cell coefficients so it adapts to any series count.
-    // R^2 = 0.9988, RMSE = 0.51%, max error = 2.19%
-    voltageToSoc: (packVoltage, seriesCount) => {
-        if (!Number.isFinite(packVoltage) || !seriesCount || seriesCount <= 0) return 0;
-        const v = packVoltage / seriesCount;
-        const soc = -226.8723 * v * v * v + 2566.6181 * v * v - 9524.9099 * v + 11635.6455;
+    // ── Per-Pack Polynomial SoC ────────────────────────────────────────
+    // Each pack has its own 3rd-order polynomial fit on PACK-level voltage,
+    // generated from the master cell lookup table scaled by series count.
+    // Coefficients are stored in packCfg.socCoeffs = [a, b, c, d] where
+    //   SoC(%) = a*V^3 + b*V^2 + c*V + d   (V = pack voltage)
+
+    voltageToSoc: (packVoltage, packCfg) => {
+        if (!Number.isFinite(packVoltage) || !packCfg) return 0;
+        // Ensure coefficients exist (generate on first call if missing)
+        if (!packCfg.socCoeffs || packCfg.socCoeffs.length !== 4) {
+            packCfg.socCoeffs = Physics.generateSocCoeffs(packCfg.series);
+        }
+        const [a, b, c, d] = packCfg.socCoeffs;
+        const v = packVoltage;
+        const soc = a * v * v * v + b * v * v + c * v + d;
         return Math.max(0, Math.min(100, Math.round(soc * 100) / 100));
+    },
+
+    // Generate polynomial coefficients for a given series count using
+    // least-squares fit (normal equations) on the cell lookup table.
+    generateSocCoeffs: (seriesCount) => {
+        if (!seriesCount || seriesCount <= 0) return [0, 0, 0, 0];
+        const packV = CELL_LOOKUP.voltage.map(v => v * seriesCount);
+        const soc = CELL_LOOKUP.soc;
+        return Physics._polyfit(packV, soc, 3);
+    },
+
+    // 3rd-order polynomial least-squares fit using normal equations.
+    // Solves (X^T X) * coeffs = X^T y where X is the Vandermonde matrix.
+    _polyfit: (xArr, yArr, degree) => {
+        const n = xArr.length;
+        const m = degree + 1; // number of coefficients
+
+        // Build Vandermonde matrix X (n x m) where X[i][j] = x[i]^(degree-j)
+        // and normal equations: A = X^T X (m x m), b = X^T y (m x 1)
+        const A = Array.from({ length: m }, () => new Array(m).fill(0));
+        const b = new Array(m).fill(0);
+
+        for (let i = 0; i < n; i++) {
+            const xi = xArr[i];
+            const yi = yArr[i];
+            // Compute powers of xi: [x^degree, x^(degree-1), ..., x^0]
+            const powers = new Array(m);
+            powers[m - 1] = 1;
+            for (let j = m - 2; j >= 0; j--) {
+                powers[j] = powers[j + 1] * xi;
+            }
+            for (let j = 0; j < m; j++) {
+                b[j] += powers[j] * yi;
+                for (let k = 0; k < m; k++) {
+                    A[j][k] += powers[j] * powers[k];
+                }
+            }
+        }
+
+        // Solve A * coeffs = b using Gaussian elimination with partial pivoting
+        const aug = A.map((row, i) => [...row, b[i]]);
+        for (let col = 0; col < m; col++) {
+            // Partial pivoting
+            let maxRow = col;
+            for (let row = col + 1; row < m; row++) {
+                if (Math.abs(aug[row][col]) > Math.abs(aug[maxRow][col])) maxRow = row;
+            }
+            [aug[col], aug[maxRow]] = [aug[maxRow], aug[col]];
+
+            const pivot = aug[col][col];
+            if (Math.abs(pivot) < 1e-12) continue;
+            for (let j = col; j <= m; j++) aug[col][j] /= pivot;
+            for (let row = 0; row < m; row++) {
+                if (row === col) continue;
+                const factor = aug[row][col];
+                for (let j = col; j <= m; j++) aug[row][j] -= factor * aug[col][j];
+            }
+        }
+
+        return aug.map(row => row[m]);
     },
 
     estimateSocFromReferenceVoltage: (packCfg, vol, packSpecs) => {
         if (!Number.isFinite(vol)) return Physics.calculateSoC(vol, packSpecs.minV, packSpecs.maxV);
-        return Physics.voltageToSoc(vol, packCfg.series);
+        return Physics.voltageToSoc(vol, packCfg);
     },
 
     interpolateReferencePointByTime: (packCfg, targetTimeS) => {
@@ -2240,6 +2315,7 @@ window.onload = () => {
             referenceSocWhCurve: [],
             referenceTelemetry: [],
             referenceLabel: HARD_CODED_REFERENCE_PROFILE.label,
+            socCoeffs: null,
             ...p
         }));
     }
@@ -2248,6 +2324,12 @@ window.onload = () => {
         if (p.series === 14) {
             p.series = 17;
             p.mfgAh = 85.0;
+        }
+    });
+    // Auto-generate per-pack polynomial SoC coefficients from cell lookup table
+    SYSTEM_CONFIG.packs.forEach(pack => {
+        if (!pack.socCoeffs || pack.socCoeffs.length !== 4) {
+            pack.socCoeffs = Physics.generateSocCoeffs(pack.series);
         }
     });
 
