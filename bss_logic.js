@@ -8,7 +8,7 @@ const CELL_LOOKUP = {
 
 const DEFAULT_CONFIG = {
     // Google Script URL
-    url: "https://script.google.com/macros/s/AKfycbzt1c0JWoNCtQZ4Qdg1bn8K2KT9GdhRmGZzs0KrjY2MZLnzEkzaL5f8alIDZRFj1Gjk7g/exec",
+    url: "https://script.google.com/macros/s/AKfycbyArXRfmbJzJsQBnTT2CkjdBillW9X4jOFE76UEW0Ihi3uUW2bJJoos9bHeezHMAQ_ckQ/exec",
 
     // [Requirement 2] Cell Definitions (21700 3.7V-4.2V 5Ah)
     cells: [
@@ -47,7 +47,13 @@ let AppState = {
     selectedCycleBySlot: {},
     analysisStats: null,
     minTableFilter: 'ALL',
-    minTableWindow: 1
+    minTableWindow: 1,
+    // Idle sub-state visibility filter (default: hide all three noisy states)
+    idleFilter: {
+        showStickyRelay: false,      // STICKY_RELAY_IDLE
+        showChargingIdle: false,     // CHARGING_IDLE
+        showDischargingIdle: false   // DISCHARGING_IDLE
+    }
 };
 let alertSent = false;
 let stickyAlertSent = false;
@@ -174,6 +180,39 @@ const Physics = {
     // Pass 2: Scan history for consecutive CHARGING_IDLE / DISCHARGING_IDLE runs.
     // If a run exceeds STICKY_THRESHOLD_MS, upgrade entire run to STICKY_RELAY_IDLE.
     // Rationale: brief 0A pauses during charge/discharge are normal; sustained 0A means relay is stuck.
+    // Returns true if the given detailedStatus should be visible in charts/tables
+    // per the current AppState.idleFilter. CHARGING, DISCHARGING, REAL_IDLE are always visible.
+    isStateVisible: (detailedStatus) => {
+        const f = (AppState && AppState.idleFilter) || {};
+        if (detailedStatus === 'STICKY_RELAY_IDLE')   return !!f.showStickyRelay;
+        if (detailedStatus === 'CHARGING_IDLE')       return !!f.showChargingIdle;
+        if (detailedStatus === 'DISCHARGING_IDLE')    return !!f.showDischargingIdle;
+        return true;
+    },
+
+    // Highlight color for anomaly states (sticky relay / charging idle / discharging idle).
+    // Returns null for normal states so they render with the default line color and no point.
+    highlightColor: (detailedStatus) => {
+        if (detailedStatus === 'STICKY_RELAY_IDLE')   return '#da3633'; // red
+        if (detailedStatus === 'CHARGING_IDLE')       return '#d29922'; // amber
+        if (detailedStatus === 'DISCHARGING_IDLE')    return '#ff6b9d'; // pink
+        return null;
+    },
+
+    // Build per-point styling arrays for a dataset so anomaly points render as large
+    // colored dots while normal points are invisible (pointRadius 0).
+    buildPointStyle: (entries) => {
+        const radius = [];
+        const bg = [];
+        const border = [];
+        for (const e of entries) {
+            const c = Physics.highlightColor(e && e.detailedStatus);
+            if (c) { radius.push(5); bg.push(c); border.push('#0f1115'); }
+            else   { radius.push(0); bg.push('transparent'); border.push('transparent'); }
+        }
+        return { radius, bg, border };
+    },
+
     applyStickyRelayUpgrade: (history, thresholdMs) => {
         const STICKY_THRESHOLD_MS = thresholdMs || 60000; // default 60 seconds
         let runStart = null;
@@ -840,52 +879,83 @@ const Charts = {
         const ctx = document.getElementById('batChart').getContext('2d');
         const recent = history.slice(-300);
 
+        // Apply idle-state visibility filter: null-out hidden points so
+        // Chart.js breaks the line at those gaps instead of interpolating.
+        const mask = recent.map(d => Physics.isStateVisible(d.detailedStatus));
+        const labels = recent.map(d => d.time.split(' ')[1]);
+        const vArr = recent.map((d, i) => mask[i] ? d.vol   : null);
+        const sArr = recent.map((d, i) => mask[i] ? d.soc   : null);
+        const aArr = recent.map((d, i) => mask[i] ? d.amp   : null);
+        const pArr = recent.map((d, i) => mask[i] ? d.power : null);
+
+        // Per-point highlight styling for anomaly states (only visible when filter is on)
+        const style = Physics.buildPointStyle(recent.map((d, i) => mask[i] ? d : null));
+
+        // In-place update if chart already exists (preserves state, no blink)
         if (AppState.chartInstance) {
-            AppState.chartInstance.destroy();
+            const c = AppState.chartInstance;
+            c.data.labels = labels;
+            c.data.datasets[0].data = vArr;
+            c.data.datasets[0].pointRadius = style.radius;
+            c.data.datasets[0].pointBackgroundColor = style.bg;
+            c.data.datasets[0].pointBorderColor = style.border;
+            c.data.datasets[1].data = sArr;
+            c.data.datasets[2].data = aArr;
+            c.data.datasets[3].data = pArr;
+            c.update('none');
+            return;
         }
 
         AppState.chartInstance = new Chart(ctx, {
             type: 'line',
             data: {
-                labels: recent.map(d => d.time.split(' ')[1]),
+                labels: labels,
                 datasets: [
                     {
                         label: 'Voltage',
-                        data: recent.map(d => d.vol),
+                        data: vArr,
                         borderColor: '#39c5cf',
                         backgroundColor: '#39c5cf',
                         yAxisID: 'y',
                         tension: 0.3,
-                        pointRadius: 0
+                        pointRadius: style.radius,
+                        pointBackgroundColor: style.bg,
+                        pointBorderColor: style.border,
+                        pointBorderWidth: 1.5,
+                        pointHoverRadius: 7,
+                        spanGaps: false
                     },
                     {
                         label: 'SoC',
-                        data: recent.map(d => d.soc),
+                        data: sArr,
                         borderColor: '#a371f7',
                         backgroundColor: '#a371f7',
                         yAxisID: 'y_soc',
                         tension: 0.3,
-                        pointRadius: 0
+                        pointRadius: 0,
+                        spanGaps: false
                     },
                     {
                         label: 'Current',
-                        data: recent.map(d => d.amp),
+                        data: aArr,
                         borderColor: '#2ea043',
                         backgroundColor: '#2ea043',
                         yAxisID: 'y_curr',
                         borderDash: [5,5],
                         tension: 0.3,
-                        pointRadius: 0
+                        pointRadius: 0,
+                        spanGaps: false
                     },
                     {
                         label: 'Power',
-                        data: recent.map(d => d.power),
+                        data: pArr,
                         borderColor: '#ff9800',
                         backgroundColor: '#ff9800',
                         yAxisID: 'y_pow',
                         borderDash: [2,2],
                         tension: 0.3,
-                        pointRadius: 0
+                        pointRadius: 0,
+                        spanGaps: false
                     }
                 ]
             },
@@ -980,6 +1050,12 @@ const UI = {
     },
 
     switchView: (viewId) => {
+        // Destroy battery chart when leaving the battery detail view so a fresh
+        // chart is created on next entry (in-place updates assume same view).
+        if (AppState.chartInstance && viewId !== AppState.currentView) {
+            AppState.chartInstance.destroy();
+            AppState.chartInstance = null;
+        }
         AppState.currentView = viewId;
         UI.renderSidebar();
         UI.renderDashboard();
@@ -1574,9 +1650,18 @@ const UI = {
             endSlider.min = 0; endSlider.max = maxIdx; endSlider.value = maxIdx;
         }
 
+        // Sync checkbox UI to current filter state before first render
+        UI.syncIdleFilterCheckboxes();
+
         // Render chart + table + range labels for full range
         UI.renderCycleModalView(entries);
         document.getElementById('cycle-detail-modal').style.display = 'flex';
+
+        // Auto-pause sync while modal is open so the user can inspect without interruption
+        if (AppState.updateInterval) {
+            AppState._syncPausedByModal = true;
+            API.toggleSync();
+        }
     },
 
     onCycleRangeChange: () => {
@@ -1627,6 +1712,11 @@ const UI = {
             ? entries.filter((_, i) => i % Math.ceil(entries.length / MAX_CHART) === 0)
             : entries;
 
+        // Apply idle-state visibility filter as a null-mask (breaks line at hidden points)
+        const cMask = chartEntries.map(e => Physics.isStateVisible(e.detailedStatus));
+        // Per-point highlight styling for anomaly states
+        const cStyle = Physics.buildPointStyle(chartEntries.map((e, i) => cMask[i] ? e : null));
+
         // Build chart with downsampled data
         const chartEl = document.getElementById('cycle-detail-chart');
         if (chartEl && chartEntries.length > 1) {
@@ -1636,10 +1726,10 @@ const UI = {
                 data: {
                     labels: chartEntries.map(e => e.time.split(' ')[1] || e.time),
                     datasets: [
-                        { label: 'Voltage', data: chartEntries.map(e => e.vol), borderColor: '#39c5cf', yAxisID: 'y', tension: 0.3, pointRadius: 0 },
-                        { label: 'SoC%', data: chartEntries.map(e => e.soc), borderColor: '#a371f7', yAxisID: 'y_soc', tension: 0.3, pointRadius: 0 },
-                        { label: 'Current', data: chartEntries.map(e => e.amp), borderColor: '#2ea043', yAxisID: 'y_curr', borderDash: [4,3], tension: 0.3, pointRadius: 0 },
-                        { label: 'Power', data: chartEntries.map(e => e.power), borderColor: '#ff9800', yAxisID: 'y_pow', borderDash: [2,2], tension: 0.3, pointRadius: 0 }
+                        { label: 'Voltage', data: chartEntries.map((e, i) => cMask[i] ? e.vol   : null), borderColor: '#39c5cf', yAxisID: 'y',      tension: 0.3, pointRadius: cStyle.radius, pointBackgroundColor: cStyle.bg, pointBorderColor: cStyle.border, pointBorderWidth: 1.5, pointHoverRadius: 7, spanGaps: false },
+                        { label: 'SoC%',    data: chartEntries.map((e, i) => cMask[i] ? e.soc   : null), borderColor: '#a371f7', yAxisID: 'y_soc',  tension: 0.3, pointRadius: 0, spanGaps: false },
+                        { label: 'Current', data: chartEntries.map((e, i) => cMask[i] ? e.amp   : null), borderColor: '#2ea043', yAxisID: 'y_curr', borderDash: [4,3], tension: 0.3, pointRadius: 0, spanGaps: false },
+                        { label: 'Power',   data: chartEntries.map((e, i) => cMask[i] ? e.power : null), borderColor: '#ff9800', yAxisID: 'y_pow',  borderDash: [2,2], tension: 0.3, pointRadius: 0, spanGaps: false }
                     ]
                 },
                 options: {
@@ -1660,11 +1750,14 @@ const UI = {
             chartEl.getContext('2d').clearRect(0, 0, chartEl.width, chartEl.height);
         }
 
+        // Filter out hidden idle states from the table entirely
+        const visibleEntries = entries.filter(e => Physics.isStateVisible(e.detailedStatus));
+
         // Cap table at 200 rows for performance
         const MAX_TABLE = 200;
         const tbody = document.getElementById('cycle-modal-table-body');
         tbody.innerHTML = '';
-        const tableEntries = entries.length > MAX_TABLE ? entries.slice(0, MAX_TABLE) : entries;
+        const tableEntries = visibleEntries.length > MAX_TABLE ? visibleEntries.slice(0, MAX_TABLE) : visibleEntries;
         tableEntries.forEach(e => {
             const tr = document.createElement('tr');
             const bi = Physics.statusBadgeInfo(e.detailedStatus || e.status);
@@ -1678,8 +1771,9 @@ const UI = {
             `;
             tbody.appendChild(tr);
         });
-        const note = entries.length > MAX_TABLE ? ` (showing first ${MAX_TABLE})` : '';
-        document.getElementById('cycle-modal-entry-count').innerText = `${entries.length} data points${note}`;
+        const note = visibleEntries.length > MAX_TABLE ? ` (showing first ${MAX_TABLE})` : '';
+        const hiddenNote = entries.length !== visibleEntries.length ? ` · ${entries.length - visibleEntries.length} hidden by filter` : '';
+        document.getElementById('cycle-modal-entry-count').innerText = `${visibleEntries.length} of ${entries.length} data points${note}${hiddenNote}`;
     },
 
     closeCycleModal: () => {
@@ -1687,6 +1781,48 @@ const UI = {
         if (AppState.cycleChartInstance) { AppState.cycleChartInstance.destroy(); AppState.cycleChartInstance = null; }
         AppState.cycleModalEntries = null;
         AppState.cycleModalCycle = null;
+        // Resume auto-sync if it was auto-paused when the modal opened
+        if (AppState._syncPausedByModal) {
+            AppState._syncPausedByModal = false;
+            if (!AppState.updateInterval) API.toggleSync();
+        }
+    },
+
+    // Sync idle-filter checkbox UI state with AppState.idleFilter
+    syncIdleFilterCheckboxes: () => {
+        const f = AppState.idleFilter || {};
+        ['tog-sticky', 'tog-chg-idle', 'tog-dsch-idle',
+         'tog-sticky-bat', 'tog-chg-idle-bat', 'tog-dsch-idle-bat'].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (id.includes('sticky'))      el.checked = !!f.showStickyRelay;
+            else if (id.includes('chg'))    el.checked = !!f.showChargingIdle;
+            else if (id.includes('dsch'))   el.checked = !!f.showDischargingIdle;
+        });
+    },
+
+    onIdleFilterChange: (source) => {
+        // Read whichever set of checkboxes the user clicked, fall back to existing state
+        const read = (ids) => {
+            for (const id of ids) {
+                const el = document.getElementById(id);
+                if (el) return el.checked;
+            }
+            return null;
+        };
+        const sticky = read(['tog-sticky', 'tog-sticky-bat']);
+        const chg    = read(['tog-chg-idle', 'tog-chg-idle-bat']);
+        const dsch   = read(['tog-dsch-idle', 'tog-dsch-idle-bat']);
+        AppState.idleFilter = {
+            showStickyRelay:     sticky !== null ? sticky : AppState.idleFilter.showStickyRelay,
+            showChargingIdle:    chg    !== null ? chg    : AppState.idleFilter.showChargingIdle,
+            showDischargingIdle: dsch   !== null ? dsch   : AppState.idleFilter.showDischargingIdle
+        };
+        UI.syncIdleFilterCheckboxes();
+
+        // Re-render whichever views are currently visible
+        if (AppState.cycleModalEntries) UI.renderCycleModalView(AppState.cycleModalEntries);
+        if (typeof AppState.currentView === 'number') UI.renderSlot(AppState.currentView);
     },
 
     applyCycleDurationFilter: () => {
@@ -1835,6 +1971,9 @@ const UI = {
         document.getElementById('view-battery').style.display = 'block';
         document.getElementById('view-reference').style.display = 'none';
         document.getElementById('page-title').innerText = slotConfig.name + " Detail";
+
+        // Sync idle-filter checkbox UI on the battery detail view
+        UI.syncIdleFilterCheckboxes();
 
         document.getElementById('cfg-cell-type').innerText = cellCfg.name;
         document.getElementById('cfg-s').innerText = specs.series;
@@ -2141,6 +2280,19 @@ const API = {
         API.fetchData();
         if(AppState.updateInterval) clearInterval(AppState.updateInterval);
         AppState.updateInterval = setInterval(API.fetchData, 5000);
+    },
+    toggleSync: () => {
+        const btn = document.getElementById('btn-pause-sync');
+        const status = document.getElementById('conn-status');
+        if (AppState.updateInterval) {
+            clearInterval(AppState.updateInterval);
+            AppState.updateInterval = null;
+            if (btn) btn.innerText = '▶ Resume Sync';
+            if (status) { status.innerText = 'PAUSED'; status.style.color = 'var(--accent-warning)'; }
+        } else {
+            API.startDataLoop();
+            if (btn) btn.innerText = '⏸ Pause Sync';
+        }
     },
     fetchData: async () => {
         const statusEl = document.getElementById('conn-status');

@@ -6,6 +6,29 @@
 }
 
 * { box-sizing: border-box; }
+
+/* Idle-state visibility toggle switches (battery detail view + cycle modal) */
+.idle-filter-toggles {
+    display: inline-flex;
+    gap: 12px;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+}
+.idle-filter-toggles label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    user-select: none;
+}
+.idle-filter-toggles input[type="checkbox"] {
+    accent-color: var(--accent-warning);
+    cursor: pointer;
+}
+#btn-pause-sync:hover { background: #30363d; }
+
 body { background-color: var(--bg-main); color: var(--text-main); font-family: 'Inter', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; font-size: 14px; }
 
 /* SIDEBAR */

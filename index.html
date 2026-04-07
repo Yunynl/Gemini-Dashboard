@@ -36,6 +36,7 @@
             <span class="nav-tag" style="border-color:var(--accent-warning); color:var(--accent-warning);">LOCAL</span>
         </div>
         <div class="nav-item" onclick="UI.openSettings()"><span>System Configuration</span></div>
+        <button id="btn-pause-sync" onclick="API.toggleSync()" style="margin: 8px 10px; padding: 6px 10px; background:#21262d; border:1px solid #30363d; color:#c9d1d9; border-radius:6px; cursor:pointer; font-family:'JetBrains Mono'; font-size:0.7rem;">⏸ Pause Sync</button>
         <div id="conn-status" style="padding: 10px; font-size: 0.7rem; text-align: center; font-family:'JetBrains Mono';">DISCONNECTED</div>
     </div>
 </div>
@@ -136,9 +137,18 @@
             </div>
 
             <div class="dashboard-grid" style="grid-template-columns: 2fr 1fr;">
-                <div class="card" style="height: 400px;">
-                    <span class="metric-label">Charge Profile</span>
-                    <canvas id="batChart"></canvas>
+                <div class="card" style="height: 400px; display:flex; flex-direction:column;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                        <span class="metric-label">Charge Profile</span>
+                        <div class="idle-filter-toggles">
+                            <label><input type="checkbox" id="tog-sticky-bat"    onchange="UI.onIdleFilterChange()"> Sticky Relay</label>
+                            <label><input type="checkbox" id="tog-chg-idle-bat"  onchange="UI.onIdleFilterChange()"> CHG Idle</label>
+                            <label><input type="checkbox" id="tog-dsch-idle-bat" onchange="UI.onIdleFilterChange()"> DSCH Idle</label>
+                        </div>
+                    </div>
+                    <div style="flex:1; position:relative; min-height:0;">
+                        <canvas id="batChart"></canvas>
+                    </div>
                 </div>
 
                 <div class="card">
@@ -345,8 +355,13 @@
 
 <div id="cycle-detail-modal" class="modal-overlay" style="display:none; align-items:flex-start; padding:40px 20px; overflow-y:auto;">
     <div class="modal" style="max-width:960px; width:100%; max-height:90vh; overflow-y:auto;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">
             <h2 id="cycle-modal-title" style="margin:0;">Cycle Detail</h2>
+            <div class="idle-filter-toggles">
+                <label><input type="checkbox" id="tog-sticky"     onchange="UI.onIdleFilterChange()"> Sticky Relay</label>
+                <label><input type="checkbox" id="tog-chg-idle"   onchange="UI.onIdleFilterChange()"> CHG Idle</label>
+                <label><input type="checkbox" id="tog-dsch-idle"  onchange="UI.onIdleFilterChange()"> DSCH Idle</label>
+            </div>
             <button class="btn btn-secondary" onclick="UI.closeCycleModal()">✕ Close</button>
         </div>
 
