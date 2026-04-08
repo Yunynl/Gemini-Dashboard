@@ -8,7 +8,7 @@ const CELL_LOOKUP = {
 
 const DEFAULT_CONFIG = {
     // Google Script URL
-    url: "https://script.google.com/macros/s/AKfycbyArXRfmbJzJsQBnTT2CkjdBillW9X4jOFE76UEW0Ihi3uUW2bJJoos9bHeezHMAQ_ckQ/exec",
+    url: "https://script.google.com/macros/s/AKfycbzmUnfn8GzuLL-q5yh78a9sdzIuF9u6YBXkM43E_ttr5pYs624qok9FLFKQ-SAvXUVIDA/exec",
 
     // [Requirement 2] Cell Definitions (21700 3.7V-4.2V 5Ah)
     cells: [
