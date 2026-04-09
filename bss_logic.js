@@ -8,7 +8,7 @@ const CELL_LOOKUP = {
 
 const DEFAULT_CONFIG = {
     // Google Script URL
-    url: "https://script.google.com/macros/s/AKfycbzmUnfn8GzuLL-q5yh78a9sdzIuF9u6YBXkM43E_ttr5pYs624qok9FLFKQ-SAvXUVIDA/exec",
+    url: "https://script.google.com/macros/s/AKfycbwd2BfRMwFpxsZr1IOKG0b5xaBTGpge-CwI7MIVSNf7BOh3QlroGR8K60JbHf1MRNUjRg/exec",
 
     // [Requirement 2] Cell Definitions (21700 3.7V-4.2V 5Ah)
     cells: [
@@ -2314,8 +2314,9 @@ const API = {
         if (AppState.currentView === 'station' || (typeof AppState.currentView === 'string' && AppState.currentView.startsWith('reference:'))) return;
         const btnFeedback = document.getElementById('cmd-feedback'); btnFeedback.innerText = "Sending...";
         let url = SYSTEM_CONFIG.url.split('?')[0] + `?mode=set_control&bat=${AppState.currentView}&status=${status}`;
-        try { await fetch(url, {mode:'no-cors'}); btnFeedback.innerText = "OK"; setTimeout(()=>btnFeedback.innerText="",2000); }
-        catch(e) { btnFeedback.innerText = "Error"; }
+        try { await fetch(url); } catch(e) { /* CORB may block response but request still reaches server */ }
+        btnFeedback.innerText = "Sent ✓";
+        setTimeout(() => btnFeedback.innerText = "", 3000);
     },
     loadLocalCSV: () => {
         // Lets the user load the full PRASIMAX CSV directly from disk, bypassing Google Sheets row limits
