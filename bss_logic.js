@@ -19,12 +19,13 @@ const DEFAULT_CONFIG = {
     // User inputs Series & Total Mfg Capacity. System calculates Parallel.
     // socCoeffs: auto-generated from CELL_LOOKUP at startup (per-pack polynomial)
     packs: [
-        { id: 'p1', name: 'SWAP Bike Pack', cellId: 'c1', series: 17, mfgAh: 85.0, socCoeffs: null, referenceFullWh: null, referenceSocWhCurve: [], referenceTelemetry: [], referenceLabel: 'Hardcoded SWAP Battery 11_26 Charge' }
+        { id: 'p1', name: 'Bike Pack (13S)', cellId: 'c1', series: 13, mfgAh: 7.7, socCoeffs: null, referenceFullWh: null, referenceSocWhCurve: [], referenceTelemetry: [], referenceLabel: 'Scaled from 17S SWAP archive' }
     ],
 
-    // [Requirement 1] Slot Mapping
+    // [Requirement 1] Slot Mapping — both slots currently hold 13S bike packs.
     slots: [
-        { id: 1, name: 'SWAP Unit', packId: 'p1', colVol: 2, colAmp: 3, colStat: 4, colSoc: 5 }
+        { id: 1, name: 'Slot 1', packId: 'p1', colVol: 2, colAmp: 3, colStat: 4, colSoc: 8 },
+        { id: 2, name: 'Slot 2', packId: 'p1', colVol: 5, colAmp: 6, colStat: 7, colSoc: 9 }
     ],
 
     // SoH uses this partial SoC window when enough telemetry is available
@@ -87,6 +88,49 @@ const HARD_CODED_REFERENCE_PROFILE = {
         { timeS: 15390, soc: 90.52, voltageV: 69.75, currentA: 2.66, powerW: 185.54, cumAh: 12.2824, cumWh: 820.55 }
     ]
 };
+
+// ── Retired 17S SWAP archive ───────────────────────────────────────────
+// The original 17S/85Ah pack was retired and replaced with a 13S bike pack.
+// Its full operational history (Jul 2025 – Mar 2026) is preserved as a static
+// CSV in the project (archive_17s.csv) and lazy-loaded on first click of the
+// "SWAP 17S (Retired)" nav entry. Views render via the live slot pipeline but
+// with the DIRECT CONTROL card hidden and sendControl() short-circuited.
+const ARCHIVE_17S_ID = 'archive_17s';
+const ARCHIVE_17S_CSV_PATH = './archive_17s.csv';
+const ARCHIVE_17S_SLOT = {
+    id: ARCHIVE_17S_ID,
+    name: 'SWAP 17S (Retired)',
+    packId: 'archive_pack_17s',
+    // Column layout of the archived CSV (Date,Time,Voltage1,Current1,Status1,BAT1 %,Voltage2,...)
+    colVol: 2, colAmp: 3, colStat: 4, colSoc: 5,
+    isArchive: true
+};
+const ARCHIVE_17S_PACK = {
+    id: 'archive_pack_17s',
+    name: 'SWAP Bike Pack (17S, Retired)',
+    cellId: 'c1',
+    series: 17,
+    mfgAh: 85.0,
+    socCoeffs: null,
+    referenceFullWh: HARD_CODED_REFERENCE_PROFILE.estimatedFullWh,
+    referenceFullAh: HARD_CODED_REFERENCE_PROFILE.estimatedFullAh,
+    referenceTelemetry: HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({ ...p })),
+    referenceSocWhCurve: HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({ soc: p.soc, wh: p.cumWh })),
+    referenceLabel: HARD_CODED_REFERENCE_PROFILE.label,
+    isArchive: true
+};
+
+// Slot/pack lookup helpers that transparently resolve the retired 17S archive
+// without polluting SYSTEM_CONFIG (so the sidebar, processCSV, Station Overview,
+// and Settings stay clean).
+function findSlotCfg(id) {
+    if (id === ARCHIVE_17S_ID) return ARCHIVE_17S_SLOT;
+    return SYSTEM_CONFIG.slots.find(s => s.id === id);
+}
+function findPackCfg(packId) {
+    if (packId === ARCHIVE_17S_PACK.id) return ARCHIVE_17S_PACK;
+    return SYSTEM_CONFIG.packs.find(p => p.id === packId);
+}
 
 const Physics = {
     calculatePackSpecs: (packCfg, cellCfg) => {
@@ -1047,6 +1091,12 @@ const UI = {
         const stItem = document.getElementById('nav-station');
         if (AppState.currentView === 'station') stItem.classList.add('active');
         else stItem.classList.remove('active');
+
+        const archiveItem = document.getElementById('nav-archive-17s');
+        if (archiveItem) {
+            if (AppState.currentView === 'archive_17s') archiveItem.classList.add('active');
+            else archiveItem.classList.remove('active');
+        }
     },
 
     switchView: (viewId) => {
@@ -1064,6 +1114,10 @@ const UI = {
     renderDashboard: () => {
         if (AppState.currentView === 'station') {
             UI.renderStation();
+            return;
+        }
+        if (AppState.currentView === 'archive_17s') {
+            UI.renderArchive17S();
             return;
         }
         if (typeof AppState.currentView === 'string' && AppState.currentView.startsWith('reference:')) {
@@ -1430,6 +1484,10 @@ const UI = {
     },
 
     backToBatteryFromReference: () => {
+        if (AppState.currentView === 'archive_17s') {
+            UI.switchView('station');
+            return;
+        }
         if (typeof AppState.currentView === 'string' && AppState.currentView.startsWith('reference:')) {
             const slotId = Number(AppState.currentView.split(':')[1]);
             UI.switchView(slotId);
@@ -1484,11 +1542,22 @@ const UI = {
         if (!slotConfig) { UI.switchView('station'); return; }
         const packCfg = SYSTEM_CONFIG.packs.find(p => p.id === slotConfig.packId);
         if (!packCfg) { UI.switchView('station'); return; }
+        UI.paintReferenceView(packCfg, slotConfig.name + ' Reference Detail');
+    },
 
+    renderArchive17S: () => {
+        // Delegates to the same renderSlot pipeline that paints live slots — user
+        // gets the full dashboard (chart, cycle history, minute table, log filter).
+        // renderSlot resolves the synthetic archive slot via findSlotCfg(), hides
+        // DIRECT CONTROL, and triggers the lazy CSV load on first visit.
+        UI.renderSlot(ARCHIVE_17S_ID);
+    },
+
+    paintReferenceView: (packCfg, titleText) => {
         document.getElementById('view-station').style.display = 'none';
         document.getElementById('view-battery').style.display = 'none';
         document.getElementById('view-reference').style.display = 'block';
-        document.getElementById('page-title').innerText = slotConfig.name + ' Reference Detail';
+        document.getElementById('page-title').innerText = titleText;
 
         const telemetry = Array.isArray(packCfg.referenceTelemetry) ? [...packCfg.referenceTelemetry] : [];
         const curve = Array.isArray(packCfg.referenceSocWhCurve) ? [...packCfg.referenceSocWhCurve] : [];
@@ -1957,15 +2026,103 @@ const UI = {
             ${isReference ? `<div style="margin-top:12px;"><button class="btn btn-secondary" onclick="UI.openReferenceDetail(${slotId})">Open Reference Detail</button></div>` : ''}
         `;
     },
+    renderEmptySlot: (slotConfig, packCfg, cellCfg, specs) => {
+        // Switch to battery detail view with "—" placeholders when this slot
+        // has not reported any telemetry yet (e.g. slot 2 before the sheet
+        // column block is populated).
+        document.getElementById('view-station').style.display = 'none';
+        document.getElementById('view-battery').style.display = 'block';
+        document.getElementById('view-reference').style.display = 'none';
+        document.getElementById('page-title').innerText = slotConfig.name + " Detail";
+
+        UI.syncIdleFilterCheckboxes();
+
+        // Pack/config bar is still populated from packCfg
+        document.getElementById('cfg-cell-type').innerText = cellCfg.name;
+        document.getElementById('cfg-s').innerText = specs.series;
+        document.getElementById('cfg-p').innerText = specs.parallel;
+        document.getElementById('cfg-total-ah').innerText = packCfg.mfgAh + " Ah";
+
+        // Status bar → no telemetry
+        const bar = document.getElementById('main-status-bar');
+        const txt = document.getElementById('main-status-text');
+        const badge = document.getElementById('bat-status-badge');
+        bar.className = "card full-width status-bar-card";
+        bar.style.background = ""; bar.style.borderColor = "transparent"; bar.style.color = "inherit";
+        bar.classList.add('state-idle');
+        txt.innerText = " NO TELEMETRY YET";
+        badge.className = "status-badge st-idle";
+        badge.innerText = 'NO DATA';
+
+        // Hide warning banners
+        const stickyWarning = document.getElementById('sticky-relay-warning');
+        const fakeWarning = document.getElementById('fake-state-warning');
+        if (stickyWarning) stickyWarning.style.display = 'none';
+        if (fakeWarning) fakeWarning.style.display = 'none';
+
+        // Metric cards → "—"
+        document.getElementById('bat-soc').innerText = "—";
+        document.getElementById('bat-soc-bar').style.width = "0%";
+        document.getElementById('bat-vol').innerText = "— V";
+        document.getElementById('bat-v-range').innerText = `Range: ${specs.minV.toFixed(1)}-${specs.maxV.toFixed(1)}V`;
+        document.getElementById('bat-amp').innerText = "— A";
+        document.getElementById('bat-energy-avail').innerText = "— Wh";
+        document.getElementById('bat-energy-used').innerText = "— Wh";
+        document.getElementById('bat-soh').innerText = "—%";
+
+        // Chart → destroy prior instance + clear canvas so slot-1 data doesn't bleed over
+        if (AppState.chartInstance) {
+            try { AppState.chartInstance.destroy(); } catch (e) { /* ignore */ }
+            AppState.chartInstance = null;
+        }
+        const canvas = document.getElementById('batChart');
+        if (canvas) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.fillStyle = '#8b949e';
+            ctx.font = '14px "Inter", system-ui, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('No telemetry yet — reference profile only', canvas.width / 2, canvas.height / 2);
+            ctx.restore();
+        }
+
+        // Cycle history → empty rendering
+        if (!AppState.cycleHistoryPage) AppState.cycleHistoryPage = {};
+        if (!AppState.cycleHistoryPage[slotConfig.id]) AppState.cycleHistoryPage[slotConfig.id] = 1;
+        UI.renderCycleHistoryTable(slotConfig.id, []);
+
+        // Log table + minute table → empty placeholder
+        AppState.activeLogData = [];
+        AppState.filteredLogData = [];
+        UI.calculateTableStats([]);
+        UI.renderTable();
+        const mbody = document.getElementById('min-table-body');
+        const mcount = document.getElementById('min-table-count');
+        if (mbody) {
+            mbody.dataset.slotId = slotConfig.id;
+            mbody.innerHTML = `<tr><td colspan="7" style="text-align:center; color:#8b949e; padding:20px;">no telemetry yet</td></tr>`;
+        }
+        if (mcount) mcount.innerText = `0 min — no telemetry yet`;
+    },
     renderSlot: (id) => {
-        const d = AppState.processedData[id];
-        if (!d) return;
-
-        const slotConfig = SYSTEM_CONFIG.slots.find(s => s.id === id);
-        const packCfg = SYSTEM_CONFIG.packs.find(p => p.id === slotConfig.packId);
+        const slotConfig = findSlotCfg(id);
+        if (!slotConfig) return;
+        const packCfg = findPackCfg(slotConfig.packId);
         const cellCfg = SYSTEM_CONFIG.cells.find(c => c.id === packCfg.cellId);
-
         const specs = Physics.calculatePackSpecs(packCfg, cellCfg);
+
+        // Toggle the DIRECT CONTROL card: hidden on the read-only retired archive.
+        const ctrlCard = document.getElementById('direct-control-card');
+        if (ctrlCard) ctrlCard.style.display = slotConfig.isArchive ? 'none' : '';
+
+        const d = AppState.processedData[id];
+        if (!d || !d.history || d.history.length === 0) {
+            // Archive starts empty on first visit — kick off the lazy load, which re-renders when done.
+            if (slotConfig.isArchive) API.loadArchive17S();
+            return UI.renderEmptySlot(slotConfig, packCfg, cellCfg, specs);
+        }
 
         document.getElementById('view-station').style.display = 'none';
         document.getElementById('view-battery').style.display = 'block';
@@ -2311,7 +2468,7 @@ const API = {
         }
     },
     sendControl: async (status) => {
-        if (AppState.currentView === 'station' || (typeof AppState.currentView === 'string' && AppState.currentView.startsWith('reference:'))) return;
+        if (AppState.currentView === 'station' || AppState.currentView === ARCHIVE_17S_ID || (typeof AppState.currentView === 'string' && AppState.currentView.startsWith('reference:'))) return;
         const btnFeedback = document.getElementById('cmd-feedback'); btnFeedback.innerText = "Sending...";
         let url = SYSTEM_CONFIG.url.split('?')[0] + `?mode=set_control&bat=${AppState.currentView}&status=${status}`;
         try { await fetch(url); } catch(e) { /* CORB may block response but request still reaches server */ }
@@ -2354,6 +2511,113 @@ const API = {
         return fallbackIndex;
     },
 
+    loadArchive17S: async () => {
+        // Lazy one-shot load + cache of the retired 17S operational CSV.
+        if (AppState.processedData[ARCHIVE_17S_ID]) return;          // already loaded
+        if (AppState._archiveLoadInFlight) return;                   // fetch in progress
+        AppState._archiveLoadInFlight = true;
+        const titleEl = document.getElementById('page-title');
+        const originalTitle = titleEl ? titleEl.innerText : '';
+        if (titleEl && AppState.currentView === ARCHIVE_17S_ID) {
+            titleEl.innerText = 'SWAP 17S (Retired) — loading archive…';
+        }
+        try {
+            const res = await fetch(ARCHIVE_17S_CSV_PATH);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const txt = await res.text();
+            API.processArchiveCSV(txt);
+            if (AppState.currentView === ARCHIVE_17S_ID) UI.renderDashboard();
+        } catch (e) {
+            console.error('[archive_17s] load failed:', e);
+            if (titleEl && AppState.currentView === ARCHIVE_17S_ID) {
+                titleEl.innerText = 'SWAP 17S (Retired) — archive load failed';
+            }
+        } finally {
+            AppState._archiveLoadInFlight = false;
+            if (titleEl && titleEl.innerText.includes('loading archive')) {
+                titleEl.innerText = originalTitle;
+            }
+        }
+    },
+
+    processArchiveCSV: (text) => {
+        // Mirror of the per-slot loop in processCSV, tied to the synthetic
+        // ARCHIVE_17S_SLOT/ARCHIVE_17S_PACK instead of iterating SYSTEM_CONFIG.slots.
+        // Archive cycles are merged into AppState.cycleHistory tagged with slotId
+        // === ARCHIVE_17S_ID so they don't mix with live slot 1/2 cycles.
+        const lines = text.trim().split(/\r?\n/);
+        const data = lines.map(line => line.split(',').map(c => c.replace(/^"|"$/g, '').trim()));
+        const slot = ARCHIVE_17S_SLOT;
+        const packCfg = ARCHIVE_17S_PACK;
+        const cellCfg = SYSTEM_CONFIG.cells.find(c => c.id === packCfg.cellId) || SYSTEM_CONFIG.cells[0];
+        // Generate SoC coefficients once for the 17S pack (if not already)
+        if (!packCfg.socCoeffs || packCfg.socCoeffs.length !== 4) {
+            packCfg.socCoeffs = Physics.generateSocCoeffs(packCfg.series);
+        }
+        const specs = Physics.calculatePackSpecs(packCfg, cellCfg);
+        const colVol = slot.colVol, colAmp = slot.colAmp, colStat = slot.colStat, colSoc = slot.colSoc;
+
+        const history = [];
+        let latest = null;
+        let nonZeroCurrentCount = 0;
+        let badDataCount = 0;
+        const volMin = specs.minV * 0.80;
+        const volMax = specs.maxV * 1.15;
+
+        for (let i = 1; i < data.length; i++) {
+            const row = data[i];
+            if (row.length < 3) continue;
+            const dateStr = row[0];
+            const timeStr = row[1];
+            const vol = parseFloat(row[colVol]);
+            const amp = parseFloat(row[colAmp]);
+            if (!isFinite(vol) || !isFinite(amp) || vol <= 0 || vol < volMin || vol > volMax) {
+                badDataCount++;
+                continue;
+            }
+            const cleanTime = Physics.formatTimeDisplay(dateStr, timeStr);
+            const ts = Physics.getTimestamp(dateStr, timeStr);
+            if (!isFinite(ts)) { badDataCount++; continue; }
+            const soc = Physics.estimateSocFromReferenceVoltage(packCfg, vol, specs);
+            const power = vol * amp;
+            const baseStatus = Physics.normalizeStatus((row[colStat] || "IDLE").toUpperCase());
+            const detailedStatus = Physics.classifyState(baseStatus, amp);
+            const entry = { time: cleanTime, timestamp: ts, vol, amp, power, soc, status: baseStatus, detailedStatus };
+            history.push(entry);
+            latest = entry;
+            if (Math.abs(amp) > 0.001) nonZeroCurrentCount++;
+        }
+
+        Physics.applyStickyRelayUpgrade(history, 60000);
+
+        if (!latest) {
+            console.warn('[archive_17s] no valid rows parsed — check CSV format');
+            return;
+        }
+
+        const energyAvailable = specs.idealWh * (latest.soc / 100);
+        const dischargedWh = Physics.calculateTrapezoidalEnergy(history);
+        const analysis = Analytics.analyzeSlotHistory(slot.id, history, packCfg, specs);
+        const currentSoH = analysis.activeEvent?.soh && analysis.activeEvent.soh !== "--"
+            ? analysis.activeEvent.soh
+            : (analysis.cycles.length > 0 && analysis.cycles[0].soh !== "--" ? analysis.cycles[0].soh : "--");
+
+        AppState.processedData[slot.id] = {
+            ...latest,
+            meta: { pack: packCfg, cell: cellCfg, parallel: specs.parallel, vRange: `${specs.minV.toFixed(1)}-${specs.maxV.toFixed(1)}V` },
+            energy: { available: energyAvailable, total: specs.idealWh, discharged: dischargedWh },
+            soh: currentSoH,
+            history,
+            analysisRows: analysis.analysisRows,
+            activeEvent: analysis.activeEvent,
+            diagnostics: { colVol, colAmp, colStat, colSoc, nonZeroCurrentCount, badDataCount, totalRows: data.length - 1, isArchive: true }
+        };
+
+        // Merge archive cycles into global cycleHistory (dedup by slotId)
+        const nonArchiveCycles = (AppState.cycleHistory || []).filter(c => c.slotId !== slot.id);
+        AppState.cycleHistory = [...nonArchiveCycles, ...analysis.cycles].sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+    },
+
     processCSV: (text) => {
         stickyAlertSent = false; // reset email alert flag on new data sync
         const lines = text.trim().split(/\r?\n/);
@@ -2366,10 +2630,27 @@ const API = {
             const cellCfg = SYSTEM_CONFIG.cells.find(c => c.id === packCfg.cellId);
 
             const specs = Physics.calculatePackSpecs(packCfg, cellCfg);
-            const colVol = API.detectColumnIndex(headerRow, slot.colVol, [['voltage1'], ['voltage'], ['volt']]);
-            const colAmp = API.detectColumnIndex(headerRow, slot.colAmp, [['current1'], ['current'], ['amp']]);
-            const colStat = API.detectColumnIndex(headerRow, slot.colStat, [['status'], ['state']]);
-            const colSoc = API.detectColumnIndex(headerRow, slot.colSoc, [['bat', '%'], ['battery', 'percentage'], ['soc']]);
+            const slotSuffix = String(slot.id);
+            const colVol = API.detectColumnIndex(headerRow, slot.colVol, [
+                ['voltage' + slotSuffix], ['volt' + slotSuffix],
+                ['voltage', slotSuffix], ['volt', slotSuffix],
+                ['voltage'], ['volt']
+            ]);
+            const colAmp = API.detectColumnIndex(headerRow, slot.colAmp, [
+                ['current' + slotSuffix], ['amp' + slotSuffix],
+                ['current', slotSuffix], ['amp', slotSuffix],
+                ['current'], ['amp']
+            ]);
+            const colStat = API.detectColumnIndex(headerRow, slot.colStat, [
+                ['status' + slotSuffix], ['state' + slotSuffix],
+                ['status', slotSuffix], ['state', slotSuffix],
+                ['status'], ['state']
+            ]);
+            const colSoc = API.detectColumnIndex(headerRow, slot.colSoc, [
+                ['bat' + slotSuffix, '%'], ['bat', slotSuffix, '%'],
+                ['battery', slotSuffix, 'percentage'], ['soc' + slotSuffix], ['soc', slotSuffix],
+                ['bat', '%'], ['battery', 'percentage'], ['soc']
+            ]);
 
             const history = [];
             let latest = null;
@@ -2445,7 +2726,10 @@ const API = {
                 };
             }
         });
-        AppState.cycleHistory = cycleRecords.sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
+        // Preserve archive cycles across live syncs — only the archive pipeline
+        // produces cycles tagged with slotId === ARCHIVE_17S_ID.
+        const archiveCycles = (AppState.cycleHistory || []).filter(c => c.slotId === ARCHIVE_17S_ID);
+        AppState.cycleHistory = [...archiveCycles, ...cycleRecords].sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
         localStorage.setItem('bss_cycle_history', JSON.stringify(AppState.cycleHistory));
         document.getElementById('last-sync').innerText = "SYNC: " + new Date().toLocaleTimeString();
         UI.renderDashboard();
@@ -2472,11 +2756,41 @@ window.onload = () => {
             ...p
         }));
     }
-    // Auto-migrate: if stored pack still has old 14S config (SWAP is 17S per reference CSV metadata)
+    // Auto-migrate: the 17S SWAP pack has been retired and replaced with the 13S bike pack.
+    // Any stored p1 still carrying 17S/85Ah config gets remapped. Its live data and history
+    // are preserved on the "SWAP 17S (Retired)" archive nav entry, sourced from
+    // HARD_CODED_REFERENCE_PROFILE.
     SYSTEM_CONFIG.packs.forEach(p => {
-        if (p.series === 14) {
-            p.series = 17;
-            p.mfgAh = 85.0;
+        if (p.id === 'p1' && (p.series === 17 || p.series === 14)) {
+            p.series = 13;
+            p.mfgAh = 7.7;
+            p.name = 'Bike Pack (13S)';
+            // Force rescale on next boot
+            p.referenceFullWh = null;
+            p.referenceFullAh = null;
+            p.referenceTelemetry = [];
+            p.referenceSocWhCurve = [];
+            p.socCoeffs = null;
+        }
+    });
+    // Auto-migrate: ensure every DEFAULT_CONFIG pack exists in the stored config.
+    DEFAULT_CONFIG.packs.forEach(defPack => {
+        if (!SYSTEM_CONFIG.packs.find(p => p.id === defPack.id)) {
+            SYSTEM_CONFIG.packs.push(JSON.parse(JSON.stringify(defPack)));
+        }
+    });
+    // Auto-migrate: ensure every DEFAULT_CONFIG slot exists in the stored config.
+    DEFAULT_CONFIG.slots.forEach(defSlot => {
+        if (!SYSTEM_CONFIG.slots.find(s => s.id === defSlot.id)) {
+            SYSTEM_CONFIG.slots.push(JSON.parse(JSON.stringify(defSlot)));
+        }
+    });
+    // Auto-migrate: if a slot points at a pack that no longer exists (e.g. a ghost p2 from
+    // an earlier release), snap it back to the default pack mapping.
+    SYSTEM_CONFIG.slots.forEach(s => {
+        if (!SYSTEM_CONFIG.packs.find(p => p.id === s.packId)) {
+            const defSlot = DEFAULT_CONFIG.slots.find(x => x.id === s.id);
+            if (defSlot) s.packId = defSlot.packId;
         }
     });
     // Auto-generate per-pack polynomial SoC coefficients from cell lookup table
@@ -2486,14 +2800,26 @@ window.onload = () => {
         }
     });
 
-    const firstPack = SYSTEM_CONFIG.packs[0];
-    if (firstPack) {
-        firstPack.referenceTelemetry = HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({ ...p }));
-        firstPack.referenceSocWhCurve = HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({ soc: p.soc, wh: p.cumWh }));
-        firstPack.referenceFullWh = HARD_CODED_REFERENCE_PROFILE.estimatedFullWh;
-        firstPack.referenceFullAh = HARD_CODED_REFERENCE_PROFILE.estimatedFullAh;
-        firstPack.referenceLabel = HARD_CODED_REFERENCE_PROFILE.label;
-    }
+    // Uniformly auto-scale the 17S hardcoded archive profile onto every registered pack.
+    // For a 17S pack the scale factor is 1.0 (raw values); for a 13S pack it shrinks to ~0.765.
+    const REF_SERIES_BOOT = 17;
+    SYSTEM_CONFIG.packs.forEach(pack => {
+        const scale = pack.series / REF_SERIES_BOOT;
+        pack.referenceFullWh = parseFloat((HARD_CODED_REFERENCE_PROFILE.estimatedFullWh * scale).toFixed(2));
+        pack.referenceFullAh = parseFloat((HARD_CODED_REFERENCE_PROFILE.estimatedFullAh * scale).toFixed(4));
+        pack.referenceTelemetry = HARD_CODED_REFERENCE_PROFILE.telemetry.map(p => ({
+            ...p,
+            voltageV: p.voltageV * scale,
+            powerW: p.powerW * scale,
+            cumWh: p.cumWh * scale
+        }));
+        pack.referenceSocWhCurve = pack.referenceTelemetry.map(p => ({ soc: p.soc, wh: p.cumWh }));
+        if (pack.series !== REF_SERIES_BOOT) {
+            pack.referenceLabel = `Scaled from 17S SWAP archive (×${pack.series}/${REF_SERIES_BOOT})`;
+        } else {
+            pack.referenceLabel = HARD_CODED_REFERENCE_PROFILE.label;
+        }
+    });
     UI.renderSidebar();
     if (SYSTEM_CONFIG.url) API.startDataLoop(); else UI.openSettings();
 };
