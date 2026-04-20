@@ -1136,7 +1136,13 @@ const UI = {
         let totWh = 0, totCap = 0, totLoad = 0, count = 0, socSum = 0;
         let stats = { CHARGING: 0, DISCHARGING: 0, IDLE: 0 };
 
-        Object.values(AppState.processedData).forEach(d => {
+        // Only aggregate LIVE slots (SYSTEM_CONFIG.slots = s1/s2). The retired
+        // 17S archive is hardcoded history — it is not an active pack and must
+        // not be counted in Station Overview totals, even after it has been
+        // lazy-loaded into AppState.processedData for the History tab.
+        SYSTEM_CONFIG.slots.forEach(slot => {
+            const d = AppState.processedData[slot.id];
+            if (!d || !d.energy) return;
             totWh += d.energy.available;
             totCap += d.energy.total;
             totLoad += (d.vol * d.amp);
@@ -2474,6 +2480,54 @@ const API = {
         try { await fetch(url); } catch(e) { /* CORB may block response but request still reaches server */ }
         btnFeedback.innerText = "Sent ✓";
         setTimeout(() => btnFeedback.innerText = "", 3000);
+    },
+
+    // ---------------------------------------------------------------
+    // Follow the MILP-optimized day-ahead plan for the currently
+    // viewed slot. Reads ./schedule_today.json (produced nightly by
+    // scheduling/export_dashboard_schedule.py), finds the current
+    // wall-clock hour, looks up what the optimizer wants this slot to
+    // be doing, then sends the same set_control command the manual
+    // DIRECT CONTROL buttons use. One click replaces the full day of
+    // manual charge/idle toggling.
+    // ---------------------------------------------------------------
+    followOptimizedSchedule: async () => {
+        if (AppState.currentView === 'station' || AppState.currentView === ARCHIVE_17S_ID || (typeof AppState.currentView === 'string' && AppState.currentView.startsWith('reference:'))) return;
+        const btnFeedback = document.getElementById('cmd-feedback');
+        btnFeedback.innerText = "Reading schedule...";
+        let plan;
+        try {
+            const r = await fetch('./schedule_today.json', { cache: 'no-cache' });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            plan = await r.json();
+        } catch (e) {
+            btnFeedback.innerText = `No schedule_today.json (${e.message})`;
+            setTimeout(() => btnFeedback.innerText = "", 4000);
+            return;
+        }
+        // Prefer the MILP (optimized) plan. Fall back to greedy only if MILP
+        // isn't in the payload (export_dashboard_schedule.py writes both when
+        // MILP succeeds).
+        const dispatcher = plan.schedules && plan.schedules.milp ? 'milp' : 'greedy';
+        const sch = plan.schedules && plan.schedules[dispatcher];
+        if (!sch) {
+            btnFeedback.innerText = "schedule_today.json has no schedules.";
+            setTimeout(() => btnFeedback.innerText = "", 4000);
+            return;
+        }
+
+        // Map slot id (1 / 2) → zero-based index in the schedule arrays.
+        const slotIdx = Math.max(0, Math.min(1, Number(AppState.currentView) - 1));
+        const hour = new Date().getHours();
+        const cWh = Number((sch.c_wh[hour]    || [])[slotIdx]) || 0;
+        const sw  = Number((sch.swapped[hour] || [])[slotIdx]) || 0;
+        const action = (sw > 0) ? 'Idle' : (cWh > 1e-3 ? 'Charging' : 'Idle');
+
+        btnFeedback.innerText = `${String(hour).padStart(2,'0')}:00 — ${dispatcher.toUpperCase()} says ${action}...`;
+        const url = SYSTEM_CONFIG.url.split('?')[0] + `?mode=set_control&bat=${AppState.currentView}&status=${action}`;
+        try { await fetch(url); } catch(e) { /* CORB tolerated */ }
+        btnFeedback.innerText = `Applied ${action} (${dispatcher.toUpperCase()} · ${String(hour).padStart(2,'0')}:00) ✓`;
+        setTimeout(() => btnFeedback.innerText = "", 4000);
     },
     loadLocalCSV: () => {
         // Lets the user load the full PRASIMAX CSV directly from disk, bypassing Google Sheets row limits
